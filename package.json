@@ -1,0 +1,19 @@
+{
+  "name": "@wisdomcircuits/ai-gateway-client",
+  "version": "0.1.0",
+  "description": "TypeScript client for the Wisdom Circuits AI Gateway microservice",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "prepare": "tsc"
+  },
+  "devDependencies": {
+    "typescript": "^5.0.0"
+  },
+  "license": "UNLICENSED",
+  "private": true
+}
