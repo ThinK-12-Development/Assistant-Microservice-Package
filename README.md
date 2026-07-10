@@ -1,20 +1,47 @@
-# @wisdomcircuits/ai-gateway-client
+# @wisdomcircuit/ai-gateway-client
 
-TypeScript HTTP client for the Wisdom Circuits AI Gateway microservice.
+TypeScript HTTP client for the Wisdom Circuits AI Gateway microservice. Provides a typed, promise-based interface for all gateway endpoints — assistants, threads, messages (streaming and non-streaming), completions, embeddings, and image generation.
+
+Distributed as a private git dependency. No npm registry needed.
+
+---
+
+## What is this?
+
+The AI Gateway is an internal microservice that acts as a unified proxy to multiple AI providers (OpenAI, Anthropic, etc.). It handles:
+
+- **Assistants** — persistent, configured AI agents with their own instructions, model, and settings
+- **Threads** — conversation histories tied to a specific assistant
+- **Messages** — sending prompts and receiving responses (streaming or non-streaming)
+- **Completions** — one-shot prompts without a thread
+- **Embeddings** — vector embeddings for semantic search
+- **Image generation** — text-to-image via configured providers
+
+This package is the client you drop into any application to talk to that gateway. It handles authentication, error parsing (including rate limit errors with retry timing), and streaming response parsing.
+
+---
+
+## Requirements
+
+- Node.js 18+ (uses native `fetch` and `ReadableStream`)
+- TypeScript 5+ (if using in a TS project)
+- A valid gateway API key — obtain from the MS admin panel
+
+---
 
 ## Installation
 
-Add as a git dependency in your project's `package.json`:
+Add to your project's `package.json` as a git dependency, pinned to a specific release tag:
 
 ```json
 {
   "dependencies": {
-    "@wisdomcircuits/ai-gateway-client": "github:ThinK-12-Development/assistant-microservice-package#v0.1.0"
+    "@wisdomcircuits/ai-gateway-client": "github:ThinK-12-Development/Assistant-Microservice-Package#v0.1.0"
   }
 }
 ```
 
-Then:
+Then install:
 
 ```bash
 npm install
@@ -22,54 +49,71 @@ npm install
 yarn install
 ```
 
-The `prepare` script runs `tsc` automatically — no separate build step needed.
+The `prepare` script compiles TypeScript automatically on install — no separate build step, no registry, no publish workflow. Upgrading is just changing the tag and re-running install.
 
-## Quick Start
+---
+
+## Setup
 
 ```ts
-import { GatewayClient, RateLimitError } from '@wisdomcircuits/ai-gateway-client';
+import { GatewayClient } from '@wisdomcircuits/ai-gateway-client';
 
 const client = new GatewayClient({
-  baseUrl: 'https://your-gateway-url',
-  apiKey: 'gw_your_api_key',
+  baseUrl: process.env.GATEWAY_URL!,      // base URL of your MS deployment
+  apiKey: process.env.GATEWAY_API_KEY!,   // API key from the MS admin panel
 });
 ```
+
+Get your API key and base URL from the MS admin panel. Always load them from environment variables — never hardcode.
+
+---
 
 ## Usage
 
 ### Non-streaming message
 
+Best for server-side use or when you don't need progressive rendering.
+
 ```ts
+// Create a thread for the conversation
 const thread = await client.createThread('asst_abc123');
 
+// Send a message and get the full response
 const result = await client.sendMessage('asst_abc123', thread.threadId, {
   content: 'What is the capital of France?',
 });
 
-console.log(result.message.content);
+console.log(result.message.content); // "The capital of France is Paris."
 console.log(result.usage.totalTokens);
+console.log(result.latencyMs);
 ```
 
 ### Streaming message (chunk-by-chunk)
 
+Use for chat UIs where you want text to appear progressively as it's generated.
+
 ```ts
+import { RateLimitError } from '@wisdomcircuits/ai-gateway-client';
+
 try {
   for await (const chunk of client.streamMessage('asst_abc123', thread.threadId, {
     content: 'Tell me a story.',
   })) {
     if (chunk.type === 'text') {
-      process.stdout.write(chunk.text!);
+      process.stdout.write(chunk.text!); // or append to your UI state
     }
   }
 } catch (err) {
   if (err instanceof RateLimitError) {
-    console.error(`Rate limited. Retry in ${err.retryAfterSeconds}s.`);
-    // Show err.message to the user — it's already human-friendly
+    // err.message is already human-friendly — show it directly in your UI
+    console.error(`${err.message} (retry in ${err.retryAfterSeconds}s)`);
   }
 }
 ```
 
-### Streaming message (full string)
+### Streaming message (collect to string)
+
+When you want a streaming request but don't need chunk-by-chunk processing:
 
 ```ts
 const text = await client.streamMessageToString('asst_abc123', thread.threadId, {
@@ -78,12 +122,30 @@ const text = await client.streamMessageToString('asst_abc123', thread.threadId, 
 });
 ```
 
+### Passing settings (persona, context, rules)
+
+The `settings` field is passed through to the assistant on every message — use it to inject runtime context:
+
+```ts
+await client.sendMessage('asst_abc123', thread.threadId, {
+  content: 'How do I reset my password?',
+  settings: {
+    persona: 'You are a friendly support agent for Acme Corp.',
+    context: `User account: ${userEmail}`,
+    rules: ['Always end with "Is there anything else I can help you with?"'],
+  },
+});
+```
+
 ### One-shot completion (no thread)
+
+For prompts that don't need conversation history:
 
 ```ts
 const result = await client.complete({
   prompt: 'Translate "hello" to Spanish.',
   modelId: 'openai/gpt-4o-mini',
+  maxTokens: 50,
 });
 console.log(result.text); // "Hola"
 ```
@@ -92,7 +154,11 @@ console.log(result.text); // "Hola"
 
 ```ts
 const result = await client.embed({ input: 'Search query text' });
-const vector = result.embeddings[0].embedding;
+const vector = result.embeddings[0].embedding; // number[]
+console.log(result.dimension);                  // e.g. 1536
+
+// Embed multiple strings in one call:
+const batch = await client.embed({ input: ['text one', 'text two'] });
 ```
 
 ### Image generation
@@ -106,50 +172,105 @@ const result = await client.generateImage({
 console.log(result.url);
 ```
 
+### Managing assistants and threads
+
+```ts
+// List all assistants accessible with this API key
+const assistants = await client.listAssistants();
+
+// Get a specific assistant
+const assistant = await client.getAssistant('asst_abc123');
+
+// Create a thread with optional title/metadata
+const thread = await client.createThread('asst_abc123', {
+  title: 'Support session',
+  metadata: { userId: '42' },
+});
+
+// Delete a thread when the session is over
+await client.deleteThread('asst_abc123', thread.threadId);
+```
+
+### Listing available models
+
+```ts
+const models = await client.listModels();
+// [{ id, modelId, name, providerName, supportsImages, supportsImageGeneration }]
+```
+
+---
+
 ## Error Handling
 
-All errors extend `GatewayError` and include `.status`, `.code`, and `.message`.
+All errors thrown by the client extend `GatewayError` and include `.status`, `.code`, and `.message`.
 
 | Class | HTTP | When |
 |---|---|---|
 | `AuthError` | 401 | Invalid or missing API key |
-| `ForbiddenError` | 403 | Key lacks the required scope |
+| `ForbiddenError` | 403 | Key lacks the required scope for this operation |
 | `NotFoundError` | 404 | Assistant or thread not found |
 | `ValidationError` | 422 | Invalid request payload |
 | `RateLimitError` | 429 | Assistant rate limit exceeded |
 
-`RateLimitError` additionally exposes `.retryAfterSeconds` and a user-friendly `.message` — display both in your UI.
+`RateLimitError` additionally exposes `.retryAfterSeconds` and a user-friendly `.message` — present both in your UI rather than a generic error.
 
 ```ts
-import { GatewayError, RateLimitError, AuthError } from '@wisdomcircuits/ai-gateway-client';
+import { GatewayError, RateLimitError, AuthError, ForbiddenError } from '@wisdomcircuits/ai-gateway-client';
 
 try {
-  await client.sendMessage(...);
+  await client.sendMessage(assistantId, threadId, { content });
 } catch (err) {
   if (err instanceof RateLimitError) {
-    showToast(err.message, { retryIn: err.retryAfterSeconds });
+    showBanner(err.message, { retryIn: err.retryAfterSeconds });
   } else if (err instanceof AuthError) {
     redirectToLogin();
+  } else if (err instanceof ForbiddenError) {
+    showError('Your API key does not have permission for this action.');
   } else if (err instanceof GatewayError) {
-    logError(err.code, err.status, err.message);
+    logError({ code: err.code, status: err.status, message: err.message });
+  } else {
+    throw err;
   }
 }
 ```
 
-## Assistant Rate Limiting
+---
 
-Rate limits are enforced by the gateway on a rolling 60-minute window per assistant:
+## Rate Limiting
 
-- **API key** sets the default req/hr limit for all assistants under it
-- **Assistant** can override with its own limit; `null` inherits from the API key
-- On limit exceeded, the gateway returns 429 with a friendly message; the client surfaces it as `RateLimitError`
+Rate limits are enforced by the gateway per assistant on a rolling 60-minute window:
+
+- The **API key** sets a default req/hr limit for all assistants under it
+- An **assistant** can override that limit; if left unset it inherits from the key
+- When the limit is exceeded the gateway returns 429 and the client throws `RateLimitError`
+- The error's `.message` is intentionally user-friendly — present it directly in your UI
+
+---
+
+## Available API scopes
+
+Your API key must have the appropriate scope for each operation. Scopes are configured in the MS admin panel.
+
+| Scope | Operations |
+|---|---|
+| `assistants:read` | listAssistants, getAssistant |
+| `assistants:write` | createAssistant, updateAssistant, deleteAssistant |
+| `threads:write` | createThread, deleteThread |
+| `messages:write` | sendMessage |
+| `messages:stream` | streamMessage, streamMessageToString |
+| `completions:write` | complete |
+| `embeddings:read` | embed |
+| `images:write` | generateImage |
+| `models:read` | listModels |
+
+---
 
 ## Versioning
 
-Pin to a specific tag in your `package.json` to avoid breaking changes:
+Pin to a specific tag in your `package.json` to avoid unexpected breaking changes:
 
 ```json
-"@wisdomcircuits/ai-gateway-client": "github:ThinK-12-Development/assistant-microservice-package#v0.1.0"
+"@wisdomcircuits/ai-gateway-client": "github:ThinK-12-Development/Assistant-Microservice-Package#v0.1.0"
 ```
 
-When the gateway ships new features, update the tag and run `npm install` to pick them up.
+To upgrade, change the tag to the new version and run `npm install`. The `prepare` script rebuilds automatically.
