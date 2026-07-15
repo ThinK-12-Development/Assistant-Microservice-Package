@@ -167,6 +167,58 @@ export interface GenerateImageResult {
 }
 
 // ---------------------------------------------------------------------------
+// Ping / Diagnostics
+// ---------------------------------------------------------------------------
+
+export interface PingResult {
+  ok: boolean;
+  latencyMs: number;
+  timestamp: string;
+}
+
+export interface DiagnosticsResult {
+  ok: boolean;
+  latencyMs: number;
+  timestamp: string;
+  key: {
+    name: string | null;
+    scopes: string[];
+    rateLimit: number | null;
+  };
+  providers: {
+    total: number;
+    types: string[];
+  };
+  models: {
+    total: number;
+    ids: string[];
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Migration
+// ---------------------------------------------------------------------------
+
+export interface MigrateAssistantInput {
+  sourceId: string;
+  name: string;
+  instructions: string;
+  modelId: string;
+  description?: string;
+  temperature?: number;
+  maxTokens?: number;
+  fileSearch?: boolean;
+  responseFormat?: 'text' | 'json_object' | 'json_schema';
+}
+
+export interface MigrateAssistantResult {
+  sourceId: string;
+  gatewayAssistantId: string | null;
+  status: 'created' | 'failed';
+  error?: string;
+}
+
+// ---------------------------------------------------------------------------
 // Discovery
 // ---------------------------------------------------------------------------
 

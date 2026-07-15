@@ -31,4 +31,8 @@ export type {
   GenerateImageOptions,
   GenerateImageResult,
   GatewayModel,
+  PingResult,
+  DiagnosticsResult,
+  MigrateAssistantInput,
+  MigrateAssistantResult,
 } from './types.js';

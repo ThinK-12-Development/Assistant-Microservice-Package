@@ -16,6 +16,10 @@ import type {
   GenerateImageOptions,
   GenerateImageResult,
   GatewayModel,
+  PingResult,
+  DiagnosticsResult,
+  MigrateAssistantInput,
+  MigrateAssistantResult,
 } from './types.js';
 
 export class GatewayClient {
@@ -212,5 +216,90 @@ export class GatewayClient {
 
   async listModels(): Promise<GatewayModel[]> {
     return this.request<GatewayModel[]>('GET', '/api/v1/models');
+  }
+
+  // ---------------------------------------------------------------------------
+  // Connectivity
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Confirm the gateway is reachable and the API key is valid.
+   * Throws AuthError if the key is invalid, or a network error if unreachable.
+   */
+  async ping(): Promise<PingResult> {
+    const start = Date.now();
+    const res = await fetch(this.url('/api/v1/ping'), {
+      method: 'GET',
+      headers: this.headers(),
+    });
+    const latencyMs = Date.now() - start;
+    const json = await res.json().catch(() => ({}));
+    if (!res.ok) throw parseGatewayError(res.status, json);
+    return { ok: true, latencyMs, timestamp: (json as any).timestamp ?? new Date().toISOString() };
+  }
+
+  /**
+   * Return gateway health, key scopes, available providers and models.
+   * Use this to verify a complete integration and surface configuration issues.
+   */
+  async diagnostics(): Promise<DiagnosticsResult> {
+    const start = Date.now();
+    const res = await fetch(this.url('/api/v1/diagnostics'), {
+      method: 'GET',
+      headers: this.headers(),
+    });
+    const latencyMs = Date.now() - start;
+    const json = await res.json().catch(() => ({}));
+    if (!res.ok) throw parseGatewayError(res.status, json);
+    return { ...(json as DiagnosticsResult), latencyMs };
+  }
+
+  // ---------------------------------------------------------------------------
+  // Migration
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Create gateway assistants from an array of existing assistants.
+   * Each item carries a `sourceId` (your local DB id or legacy assistant id)
+   * which is echoed back in the result so you know which record to update.
+   *
+   * Failures are per-item — a single failure does not abort the batch.
+   *
+   * @example
+   * ```ts
+   * const results = await client.migrate(
+   *   chatbots.map(b => ({
+   *     sourceId: String(b.id),
+   *     name: b.name,
+   *     instructions: b.instructions,
+   *     modelId: 'openai/gpt-4o',
+   *   }))
+   * );
+   * for (const r of results) {
+   *   if (r.status === 'created') {
+   *     await db.update(chatbots).set({ gatewayAssistantId: r.gatewayAssistantId }).where(eq(chatbots.id, Number(r.sourceId)));
+   *   }
+   * }
+   * ```
+   */
+  async migrate(assistants: MigrateAssistantInput[]): Promise<MigrateAssistantResult[]> {
+    const results: MigrateAssistantResult[] = [];
+
+    for (const input of assistants) {
+      const { sourceId, ...createInput } = input;
+      try {
+        const created = await this.createAssistant(createInput);
+        results.push({ sourceId, gatewayAssistantId: created.assistantId, status: 'created' });
+      } catch (err) {
+        results.push({
+          sourceId,
+          gatewayAssistantId: null,
+          status: 'failed',
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
+    }
+
+    return results;
   }
 }
