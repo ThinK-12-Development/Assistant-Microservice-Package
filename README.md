@@ -355,38 +355,110 @@ app.get('/api/admin/gateway/diagnostics', requireAdmin, async (req, res) => {
   }
 });
 
-// POST /api/admin/gateway/migrate
-// Migrates all unmigrated assistants to the MS and writes gateway IDs back to the DB.
-// Returns per-assistant results including any failures.
-// Safe to run multiple times — only processes assistants with no gateway_assistant_id.
-app.post('/api/admin/gateway/migrate', requireAdmin, async (req, res) => {
-  try {
-    const unmigrated = await getUnmigratedAssistants(); // fetch from your DB
+// Migration state — held in memory for the lifetime of the process.
+// For multi-instance deployments, move this to your DB or Redis.
+let migrationState: {
+  status: 'idle' | 'running' | 'stopped' | 'complete';
+  total: number;
+  succeeded: number;
+  failed: number;
+  results: Array<{ sourceId: string; name: string; gatewayAssistantId: string | null; status: 'created' | 'failed'; error?: string }>;
+  stopRequested: boolean;
+} = { status: 'idle', total: 0, succeeded: 0, failed: 0, results: [], stopRequested: false };
 
-    const results = await gateway.migrate(
-      unmigrated.map(a => ({
-        sourceId: String(a.id),
-        name: a.name,
-        instructions: a.instructions,
-        modelId: a.modelId, // use the model your app has stored — must exist in MS
-        description: a.description ?? undefined,
-      }))
-    );
+const BATCH_SIZE = 5;       // assistants per batch
+const BATCH_DELAY_MS = 500; // pause between batches to avoid rate limits
 
-    // Write gateway IDs back for successful migrations
-    for (const r of results) {
-      if (r.status === 'created') {
-        await updateAssistantGatewayId(Number(r.sourceId), r.gatewayAssistantId!);
+// POST /api/admin/gateway/migrate/start
+// Begins batched migration in the background. Returns immediately.
+// Safe to call multiple times — skips already migrated assistants (idempotent).
+// If stopped mid-run, calling start again resumes from where it left off.
+app.post('/api/admin/gateway/migrate/start', requireAdmin, async (req, res) => {
+  if (migrationState.status === 'running') {
+    return res.json({ ok: false, message: 'Migration already in progress.' });
+  }
+
+  const unmigrated = await getUnmigratedAssistants();
+  if (unmigrated.length === 0) {
+    return res.json({ ok: true, message: 'All assistants already migrated.', total: 0 });
+  }
+
+  // Reset state for this run (preserve previous results from prior runs)
+  migrationState = {
+    status: 'running',
+    total: unmigrated.length,
+    succeeded: 0,
+    failed: 0,
+    results: [],
+    stopRequested: false,
+  };
+
+  // Respond immediately — migration runs in background
+  res.json({ ok: true, message: 'Migration started.', total: unmigrated.length });
+
+  // Background processing
+  setImmediate(async () => {
+    for (let i = 0; i < unmigrated.length; i += BATCH_SIZE) {
+      if (migrationState.stopRequested) {
+        migrationState.status = 'stopped';
+        break;
+      }
+
+      const batch = unmigrated.slice(i, i + BATCH_SIZE);
+      const batchResults = await gateway.migrate(
+        batch.map(a => ({
+          sourceId: String(a.id),
+          name: a.name,
+          instructions: a.instructions,
+          modelId: a.modelId, // must exist in MS — check diagnostics first
+          description: a.description ?? undefined,
+        }))
+      );
+
+      for (const r of batchResults) {
+        const assistant = batch.find(a => String(a.id) === r.sourceId)!;
+        migrationState.results.push({ ...r, name: assistant.name });
+        if (r.status === 'created') {
+          migrationState.succeeded++;
+          await updateAssistantGatewayId(Number(r.sourceId), r.gatewayAssistantId!);
+        } else {
+          migrationState.failed++;
+        }
+      }
+
+      // Pause between batches unless this is the last one
+      if (i + BATCH_SIZE < unmigrated.length && !migrationState.stopRequested) {
+        await new Promise(resolve => setTimeout(resolve, BATCH_DELAY_MS));
       }
     }
 
-    const succeeded = results.filter(r => r.status === 'created').length;
-    const failed = results.filter(r => r.status === 'failed').length;
+    if (migrationState.status === 'running') {
+      migrationState.status = 'complete';
+    }
+  });
+});
 
-    res.json({ succeeded, failed, results });
-  } catch (err: any) {
-    res.status(500).json({ ok: false, error: err.message });
+// POST /api/admin/gateway/migrate/stop
+// Requests a graceful stop after the current batch completes.
+app.post('/api/admin/gateway/migrate/stop', requireAdmin, async (req, res) => {
+  if (migrationState.status !== 'running') {
+    return res.json({ ok: false, message: 'No migration is currently running.' });
   }
+  migrationState.stopRequested = true;
+  res.json({ ok: true, message: 'Stop requested — will halt after current batch completes.' });
+});
+
+// GET /api/admin/gateway/migrate/status
+// Returns current migration progress. Poll this every 2-3 seconds while migration is running.
+app.get('/api/admin/gateway/migrate/status', requireAdmin, async (req, res) => {
+  res.json({
+    status: migrationState.status,           // idle | running | stopped | complete
+    total: migrationState.total,
+    succeeded: migrationState.succeeded,
+    failed: migrationState.failed,
+    remaining: migrationState.total - migrationState.succeeded - migrationState.failed,
+    results: migrationState.results,         // per-assistant results so far
+  });
 });
 
 // GET /api/admin/gateway/assistants
@@ -448,11 +520,20 @@ If any model is missing: show a red warning with the model name and instructions
 
 **3. Migration panel**
 Shows migration status for all assistants (calls `GET /api/admin/gateway/assistants`).
-Display a table: assistant name | migrated (yes/no) | gateway assistant ID | errors.
-A "Run Migration" button calls `POST /api/admin/gateway/migrate`.
-During migration: show a loading state per assistant.
-After migration: show per-assistant result — success with the gateway ID, or failure with the error message (e.g. "Model 'openai/gpt-4' not found in MS — add it to the MS admin panel and retry").
-Safe to re-run — only unmigrated assistants are processed.
+Display a table: assistant name | migrated (yes/no) | gateway assistant ID | error (if any).
+
+Controls:
+- **Start / Resume** button — calls `POST /api/admin/gateway/migrate/start`. Safe to call at any time; skips already migrated assistants. If a previous run was stopped, this resumes from where it left off.
+- **Stop** button (visible only when running) — calls `POST /api/admin/gateway/migrate/stop`. Halts gracefully after the current batch of 5 completes. Does not undo completed migrations.
+
+While running, poll `GET /api/admin/gateway/migrate/status` every 2 seconds and update:
+- A progress bar: X of Y migrated
+- Running counts: X succeeded, X failed, X remaining
+- The per-assistant results table as each batch completes, showing success with gateway ID or failure with error message (e.g. "Model 'openai/gpt-4' not found in MS — add it to the MS admin panel and retry")
+
+Stop polling when `status` is `complete` or `stopped`.
+
+The Start button should be disabled if any models are missing (from Section 2).
 
 **4. Cutover panel**
 Shows all migrated assistants with their current `use_gateway` state.
@@ -480,9 +561,11 @@ Using the admin UI you just built:
 
 Using the admin UI migration panel:
 
-1. Click "Run Migration"
-2. Watch per-assistant results
-3. Any `failed` items show the error — most common cause is a model not found in the MS. Add the missing model to the MS and re-run (migration is idempotent — already migrated assistants are skipped)
+1. Click **Start** — migration begins in the background, processing 5 assistants per batch
+2. Watch the progress bar and per-assistant results update in real time
+3. If you spot a pattern in the failures (wrong model, systematic error), click **Stop** — it halts after the current batch. Fix the root cause, then click **Start** again to resume. Already migrated assistants are skipped automatically.
+4. Any `failed` items show the error — most common cause is a model not found in the MS. Add the missing model in the MS admin panel and resume.
+5. Migration is complete when the status shows `complete` and remaining is 0.
 
 **Verify:** all assistants show `migrated: true` with a `gateway_assistant_id`. Confirm they appear in the MS admin panel → Assistants.
 
@@ -559,7 +642,7 @@ Once all assistants are individually verified:
 - [ ] Gateway admin UI page built with all four sections
 - [ ] `ping()` returns `ok: true` in UI
 - [ ] `diagnostics()` shows correct scopes and all required models
-- [ ] All existing assistants migrated (no failures)
+- [ ] All existing assistants migrated (start/stop/resume verified, no failures)
 - [ ] New assistant creation writes `gateway_assistant_id`
 - [ ] Chat handler branching on `use_gateway`
 - [ ] Thread continuity verified across multi-message sessions
