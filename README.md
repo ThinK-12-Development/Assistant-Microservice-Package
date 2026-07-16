@@ -268,154 +268,256 @@ Your API key must have the appropriate scope for each operation. Scopes are conf
 
 ## Integration Guide
 
-Follow these steps when integrating this package into a new application. Each step has a clear verification point — do not proceed to the next step until the current one passes.
+Follow these steps when integrating this package into a new application. Each step has a clear verification point — **do not proceed to the next step until the current one passes.**
+
+---
+
+### Before you start
+
+Complete these before touching any code:
+
+1. **Create an API key** in the MS admin panel for this app. Give it the scopes it needs (see scopes table above). Note the key value — you'll only see it once.
+2. **Note the MS base URL** — the deployed URL of the gateway microservice.
+3. **Identify the model IDs your app uses** — every model the app passes to an assistant must exist and be enabled in the MS. Model IDs use the format `provider/model-name` (e.g. `openai/gpt-4o`). Check the MS admin panel → Models to confirm. If a model your app uses is missing, add it to the MS before proceeding — migration will fail for any assistant whose model isn't found.
+
+---
 
 ### Step 1 — Install & configure
 
-Add the package and set environment variables:
+Add the package to `package.json`:
 
 ```json
-"@wisdomcircuits/ai-gateway-client": "github:ThinK-12-Development/Assistant-Microservice-Package#v0.1.0"
+"@wisdomcircuits/ai-gateway-client": "github:ThinK-12-Development/Assistant-Microservice-Package#v0.2.0"
 ```
 
 ```bash
 npm install
 ```
 
-Set in your environment (`.env`, Replit secrets, etc.):
+Add to your environment (`.env`, Replit secrets, hosting env vars):
 
 ```
 GATEWAY_URL=https://your-gateway-url
 GATEWAY_API_KEY=gw_your_api_key
 ```
 
-Create a single shared client instance:
-
-```ts
-// lib/gateway.ts
-import { GatewayClient } from '@wisdomcircuits/ai-gateway-client';
-
-export const gateway = new GatewayClient({
-  baseUrl: process.env.GATEWAY_URL!,
-  apiKey: process.env.GATEWAY_API_KEY!,
-});
-```
-
-**Verify:** app starts without errors.
+**Verify:** app starts without import errors.
 
 ---
 
-### Step 2 — Connection test
-
-Add an admin-only endpoint that calls `ping()`:
-
-```ts
-// GET /api/admin/gateway/ping  (admin auth required)
-app.get('/api/admin/gateway/ping', requireAdmin, async (req, res) => {
-  const result = await gateway.ping();
-  res.json(result);
-});
-```
-
-**Verify:** `GET /api/admin/gateway/ping` returns `{ ok: true, latencyMs: ..., timestamp: ... }`.
-
-If you get `AuthError` — the API key is wrong.
-If you get a network error — the `GATEWAY_URL` is wrong or the MS is unreachable.
-
----
-
-### Step 3 — Diagnostics
-
-Add an admin-only endpoint that calls `diagnostics()`:
-
-```ts
-// GET /api/admin/gateway/diagnostics  (admin auth required)
-app.get('/api/admin/gateway/diagnostics', requireAdmin, async (req, res) => {
-  const result = await gateway.diagnostics();
-  res.json(result);
-});
-```
-
-**Verify:** response includes your key's scopes, available providers, and model list. Confirm the scopes cover what this app needs (see scopes table above). If a scope is missing, update the API key in the MS admin panel.
-
----
-
-### Step 4 — Add gateway fields to your database
+### Step 2 — Add gateway columns to your database
 
 Add two nullable columns to your assistants/chatbots table:
 
-- `gateway_assistant_id` — the MS assistant ID after migration
-- `use_gateway` — boolean flag, default `false`, controls which path handles chat
+- `gateway_assistant_id` — text, nullable, no default — stores the MS assistant ID after migration
+- `use_gateway` — boolean, default `false` — the cutover switch per assistant
 
-Do not remove or rename existing columns yet. The old path stays active until Step 7.
+**Do not remove or modify any existing columns.** The legacy path stays active until Step 8.
 
-**Verify:** migration runs cleanly, existing data unchanged.
+**Verify:** schema migration runs cleanly, all existing records unaffected.
 
 ---
 
-### Step 5 — Migrate existing assistants
+### Step 3 — Add server-side admin endpoints
 
-Add an admin-only endpoint that calls `migrate()`:
+These endpoints are the plumbing your admin UI (Step 4) will call. Add all of them now so the UI is fully functional when you build it.
+
+All endpoints must be behind your app's admin authentication middleware.
 
 ```ts
-// POST /api/admin/gateway/migrate  (admin auth required)
-app.post('/api/admin/gateway/migrate', requireAdmin, async (req, res) => {
-  // Load all assistants that haven't been migrated yet
-  const unmigrated = await db.query.assistants.findMany({
-    where: isNull(assistants.gatewayAssistantId),
-  });
+import { GatewayClient, GatewayError } from '@wisdomcircuits/ai-gateway-client';
 
-  const results = await gateway.migrate(
-    unmigrated.map(a => ({
-      sourceId: String(a.id),
-      name: a.name,
-      instructions: a.instructions,
-      modelId: 'openai/gpt-4o',  // map to your gateway model id
-    }))
-  );
+const gateway = new GatewayClient({
+  baseUrl: process.env.GATEWAY_URL!,
+  apiKey: process.env.GATEWAY_API_KEY!,
+});
 
-  // Write gateway IDs back to your DB
-  for (const r of results) {
-    if (r.status === 'created') {
-      await db.update(assistants)
-        .set({ gatewayAssistantId: r.gatewayAssistantId })
-        .where(eq(assistants.id, Number(r.sourceId)));
-    }
+// GET /api/admin/gateway/ping
+// Confirms the gateway is reachable and the API key is valid.
+app.get('/api/admin/gateway/ping', requireAdmin, async (req, res) => {
+  try {
+    const result = await gateway.ping();
+    res.json(result);
+  } catch (err: any) {
+    res.status(500).json({ ok: false, error: err.message });
   }
+});
 
-  res.json({ results });
+// GET /api/admin/gateway/diagnostics
+// Returns key scopes, available providers, and enabled models.
+// Use this to verify the key has the right scopes and the app's models are present.
+app.get('/api/admin/gateway/diagnostics', requireAdmin, async (req, res) => {
+  try {
+    const result = await gateway.diagnostics();
+    res.json(result);
+  } catch (err: any) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+// POST /api/admin/gateway/migrate
+// Migrates all unmigrated assistants to the MS and writes gateway IDs back to the DB.
+// Returns per-assistant results including any failures.
+// Safe to run multiple times — only processes assistants with no gateway_assistant_id.
+app.post('/api/admin/gateway/migrate', requireAdmin, async (req, res) => {
+  try {
+    const unmigrated = await getUnmigratedAssistants(); // fetch from your DB
+
+    const results = await gateway.migrate(
+      unmigrated.map(a => ({
+        sourceId: String(a.id),
+        name: a.name,
+        instructions: a.instructions,
+        modelId: a.modelId, // use the model your app has stored — must exist in MS
+        description: a.description ?? undefined,
+      }))
+    );
+
+    // Write gateway IDs back for successful migrations
+    for (const r of results) {
+      if (r.status === 'created') {
+        await updateAssistantGatewayId(Number(r.sourceId), r.gatewayAssistantId!);
+      }
+    }
+
+    const succeeded = results.filter(r => r.status === 'created').length;
+    const failed = results.filter(r => r.status === 'failed').length;
+
+    res.json({ succeeded, failed, results });
+  } catch (err: any) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+// GET /api/admin/gateway/assistants
+// Returns all assistants with their migration status for display in the admin UI.
+app.get('/api/admin/gateway/assistants', requireAdmin, async (req, res) => {
+  try {
+    const assistants = await getAllAssistants(); // fetch from your DB
+    res.json(assistants.map(a => ({
+      id: a.id,
+      name: a.name,
+      modelId: a.modelId,
+      gatewayAssistantId: a.gatewayAssistantId ?? null,
+      useGateway: a.useGateway ?? false,
+      migrated: !!a.gatewayAssistantId,
+    })));
+  } catch (err: any) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+// PATCH /api/admin/gateway/assistants/:id/toggle
+// Flips use_gateway for a single assistant.
+// This is the cutover switch — flip to true to route chat through the MS.
+app.patch('/api/admin/gateway/assistants/:id/toggle', requireAdmin, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { useGateway } = req.body;
+    await updateAssistantUseGateway(Number(id), useGateway);
+    res.json({ ok: true, id, useGateway });
+  } catch (err: any) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
 });
 ```
 
-**Verify:** all assistants have a `gateway_assistant_id`. Confirm they appear in the MS admin panel.
+**Verify:** all five endpoints respond correctly when called directly (curl or Postman).
 
 ---
 
-### Step 6 — New assistants go through the gateway
+### Step 4 — Build the gateway admin UI page
 
-When creating a new assistant in your app, also create it in the MS and store the returned ID:
+Build an admin-only page in your app's UI at a path like `/admin/gateway`. This page is the control panel for the entire migration and cutover process. It must be built before you run the migration so you can monitor results and act on errors.
+
+The page has four sections:
+
+**1. Connection status**
+Calls `GET /api/admin/gateway/ping` and `GET /api/admin/gateway/diagnostics` on load.
+Display:
+- Connection indicator (green/red based on `ok`)
+- Latency
+- Key name and scopes
+- Available models list
+- Any missing scopes or models shown as warnings
+
+**2. Pre-flight model check**
+Compare the models your app's assistants use against the models returned by diagnostics.
+Display a table: assistant name | model it uses | present in MS (yes/no).
+If any model is missing: show a red warning with the model name and instructions to add it in the MS admin panel. Block migration until all models are present.
+
+**3. Migration panel**
+Shows migration status for all assistants (calls `GET /api/admin/gateway/assistants`).
+Display a table: assistant name | migrated (yes/no) | gateway assistant ID | errors.
+A "Run Migration" button calls `POST /api/admin/gateway/migrate`.
+During migration: show a loading state per assistant.
+After migration: show per-assistant result — success with the gateway ID, or failure with the error message (e.g. "Model 'openai/gpt-4' not found in MS — add it to the MS admin panel and retry").
+Safe to re-run — only unmigrated assistants are processed.
+
+**4. Cutover panel**
+Shows all migrated assistants with their current `use_gateway` state.
+A toggle per assistant calls `PATCH /api/admin/gateway/assistants/:id/toggle`.
+Show clearly which assistants are live on the gateway vs still on the legacy path.
+Include a "Switch all" button for final cutover once individual assistants are verified.
+
+**Verify:** page loads, connection status shows green, model check table populates, migration panel shows all assistants with their current status.
+
+---
+
+### Step 5 — Verify connection & pre-flight
+
+Using the admin UI you just built:
+
+1. Confirm ping returns green
+2. Confirm diagnostics shows the correct scopes for this app
+3. Confirm all models your assistants use appear in the MS model list — if any are missing, add them in the MS admin panel before continuing
+
+**Verify:** all models present, no scope warnings.
+
+---
+
+### Step 6 — Migrate existing assistants
+
+Using the admin UI migration panel:
+
+1. Click "Run Migration"
+2. Watch per-assistant results
+3. Any `failed` items show the error — most common cause is a model not found in the MS. Add the missing model to the MS and re-run (migration is idempotent — already migrated assistants are skipped)
+
+**Verify:** all assistants show `migrated: true` with a `gateway_assistant_id`. Confirm they appear in the MS admin panel → Assistants.
+
+---
+
+### Step 7 — Wire new assistant creation through the gateway
+
+When your app creates a new assistant, also create it in the MS and store the returned ID:
 
 ```ts
+// After creating the assistant in your own DB:
 const created = await gateway.createAssistant({
   name: input.name,
   instructions: input.instructions,
-  modelId: 'openai/gpt-4o',
+  modelId: input.modelId, // must exist in MS
+  description: input.description,
 });
-// Store created.assistantId as gateway_assistant_id in your DB
+
+await updateAssistantGatewayId(newAssistant.id, created.assistantId);
 ```
 
-**Verify:** create a new assistant, confirm `gateway_assistant_id` is populated and it appears in MS admin.
+If the model doesn't exist in the MS, `createAssistant()` will throw a `GatewayError` — surface this to the admin as "Model X not found in gateway — contact your MS administrator."
+
+**Verify:** create a new assistant, confirm `gateway_assistant_id` is populated, confirm it appears in MS admin.
 
 ---
 
-### Step 7 — Switch chat to gateway (per-assistant flag)
+### Step 8 — Switch chat to gateway (per-assistant)
 
-In your chat handler, branch on `use_gateway`:
+In your chat handler, branch on `useGateway`:
 
 ```ts
 if (assistant.useGateway && assistant.gatewayAssistantId) {
-  // Gateway path
-  let thread = await getOrCreateGatewayThread(sessionId, assistant.gatewayAssistantId);
+  // Gateway path — thread management via MS
+  const thread = await getOrCreateGatewayThread(sessionId, assistant.gatewayAssistantId);
   const result = await gateway.sendMessage(assistant.gatewayAssistantId, thread.threadId, {
     content: message,
   });
@@ -425,35 +527,44 @@ if (assistant.useGateway && assistant.gatewayAssistantId) {
 }
 ```
 
-Flip `use_gateway = true` on one assistant to test.
+Thread continuity: store the MS `threadId` against the session in your DB so the same thread is reused across messages. On the first message of a new session, call `gateway.createThread()` and store the returned `threadId`.
 
-**Verify:** chat works end-to-end through the gateway for the flagged assistant. Test multiple messages in the same session to confirm thread continuity.
+Use the cutover panel in your admin UI to flip `use_gateway = true` on one assistant first.
+
+**Verify:** chat works end-to-end through the gateway. Send multiple messages in the same session and confirm context is maintained (thread continuity). Check the MS admin panel → Threads to confirm threads are being created.
 
 ---
 
-### Step 8 — Full cutover & cleanup
+### Step 9 — Full cutover & cleanup
 
-Once all assistants are verified on the gateway path:
+Once all assistants are individually verified:
 
-1. Set `use_gateway = true` on all assistants
-2. Remove the legacy chat branch
-3. Remove the legacy AI SDK/OpenAI dependency
-4. Drop the old `api_key` and legacy `assistant_id` columns (or archive them)
+1. Use "Switch all" in the admin UI cutover panel to flip all assistants to `use_gateway = true`
+2. Monitor for errors over a verification period
+3. Once stable, remove the legacy chat branch from your code
+4. Remove the legacy AI SDK/OpenAI direct dependency
+5. Drop the old `api_key` and legacy `assistant_id` columns after confirming they are no longer read anywhere
 
-**Verify:** all assistants chat successfully. Remove dead code only after a period of stable operation.
+**Verify:** all assistants chat successfully through the gateway. No references to the old API remain.
 
 ---
 
 ### Integration complete checklist
 
-- [ ] Package installed, env vars set, client initialised
-- [ ] `ping()` returns `ok: true`
-- [ ] `diagnostics()` confirms correct scopes and models
-- [ ] `gateway_assistant_id` column added to DB
-- [ ] All existing assistants migrated (no null `gateway_assistant_id`)
+- [ ] API key created in MS admin with correct scopes
+- [ ] All app models confirmed present in MS
+- [ ] Package installed, env vars set
+- [ ] DB columns added (`gateway_assistant_id`, `use_gateway`)
+- [ ] All five server-side admin endpoints added and responding
+- [ ] Gateway admin UI page built with all four sections
+- [ ] `ping()` returns `ok: true` in UI
+- [ ] `diagnostics()` shows correct scopes and all required models
+- [ ] All existing assistants migrated (no failures)
 - [ ] New assistant creation writes `gateway_assistant_id`
-- [ ] Chat routes through gateway for all assistants
-- [ ] Legacy AI SDK dependency removed
+- [ ] Chat handler branching on `use_gateway`
+- [ ] Thread continuity verified across multi-message sessions
+- [ ] All assistants on gateway path
+- [ ] Legacy dependency removed
 
 ---
 
@@ -462,7 +573,7 @@ Once all assistants are verified on the gateway path:
 Pin to a specific tag in your `package.json` to avoid unexpected breaking changes:
 
 ```json
-"@wisdomcircuits/ai-gateway-client": "github:ThinK-12-Development/Assistant-Microservice-Package#v0.1.0"
+"@wisdomcircuits/ai-gateway-client": "github:ThinK-12-Development/Assistant-Microservice-Package#v0.2.0"
 ```
 
 To upgrade, change the tag to the new version and run `npm install`. The `prepare` script rebuilds automatically.
