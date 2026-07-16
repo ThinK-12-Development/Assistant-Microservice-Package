@@ -50,10 +50,13 @@ export class RateLimitError extends GatewayError {
 }
 
 export function parseGatewayError(status: number, body: unknown): GatewayError {
-  const msg =
-    typeof body === 'object' && body !== null && 'message' in body
-      ? String((body as Record<string, unknown>).message)
-      : 'An unexpected error occurred';
+  const b = typeof body === 'object' && body !== null ? (body as Record<string, unknown>) : {};
+  const nested = typeof b.error === 'object' && b.error !== null ? (b.error as Record<string, unknown>) : null;
+  const msg = nested?.message
+    ? String(nested.message)
+    : b.message
+    ? String(b.message)
+    : 'An unexpected error occurred';
 
   const details =
     typeof body === 'object' && body !== null && 'details' in body
