@@ -461,19 +461,37 @@ app.get('/api/admin/gateway/migrate/status', requireAdmin, async (req, res) => {
   });
 });
 
-// GET /api/admin/gateway/assistants
-// Returns all assistants with their migration status for display in the admin UI.
+// GET /api/admin/gateway/assistants?page=1&limit=25
+// Returns paginated assistants with their migration status for display in the admin UI.
+// Supports optional ?search= query param for filtering by name.
 app.get('/api/admin/gateway/assistants', requireAdmin, async (req, res) => {
   try {
-    const assistants = await getAllAssistants(); // fetch from your DB
-    res.json(assistants.map(a => ({
-      id: a.id,
-      name: a.name,
-      modelId: a.modelId,
-      gatewayAssistantId: a.gatewayAssistantId ?? null,
-      useGateway: a.useGateway ?? false,
+    const page = Math.max(1, parseInt(req.query.page as string) || 1);
+    const limit = Math.min(100, parseInt(req.query.limit as string) || 25);
+    const search = (req.query.search as string)?.toLowerCase() ?? '';
+    const offset = (page - 1) * limit;
+
+    let assistants = await getAllAssistants();
+    if (search) assistants = assistants.filter(a => a.name.toLowerCase().includes(search));
+    const total = assistants.length;
+    const paged = assistants.slice(offset, offset + limit);
+
+    res.json({
+      data: paged.map(a => ({
+        id: a.id,
+        name: a.name,
+        modelId: a.modelId,
+        gatewayAssistantId: a.gatewayAssistantId ?? null,
+        useGateway: a.useGateway ?? false,
       migrated: !!a.gatewayAssistantId,
-    })));
+    })),
+    pagination: {
+      page,
+      limit,
+      total,
+      totalPages: Math.ceil(total / limit),
+    },
+  });
   } catch (err: any) {
     res.status(500).json({ ok: false, error: err.message });
   }
@@ -519,7 +537,8 @@ Display a table: assistant name | model it uses | present in MS (yes/no).
 If any model is missing: show a red warning with the model name and instructions to add it in the MS admin panel. Block migration until all models are present.
 
 **3. Migration panel**
-Shows migration status for all assistants (calls `GET /api/admin/gateway/assistants`).
+Shows migration status for all assistants (calls `GET /api/admin/gateway/assistants?page=1&limit=25`).
+Support pagination — show page controls and a search/filter input for finding assistants by name. Apps may have 50–150+ assistants; do not load all at once.
 Display a table: assistant name | migrated (yes/no) | gateway assistant ID | error (if any).
 
 Controls:
@@ -536,10 +555,11 @@ Stop polling when `status` is `complete` or `stopped`.
 The Start button should be disabled if any models are missing (from Section 2).
 
 **4. Cutover panel**
-Shows all migrated assistants with their current `use_gateway` state.
-A toggle per assistant calls `PATCH /api/admin/gateway/assistants/:id/toggle`.
+Shows migrated assistants with their current `use_gateway` state — paginated 25 per page with search by name. Do not load all at once; apps may have 150+ assistants.
+A toggle per row calls `PATCH /api/admin/gateway/assistants/:id/toggle`.
 Show clearly which assistants are live on the gateway vs still on the legacy path.
-Include a "Switch all" button for final cutover once individual assistants are verified.
+Summary line above the table: "X of Y assistants on gateway."
+Include a "Switch all to Gateway" button for final cutover, disabled until at least one assistant has been individually toggled on.
 
 **Verify:** page loads, connection status shows green, model check table populates, migration panel shows all assistants with their current status.
 
