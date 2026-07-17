@@ -56,7 +56,7 @@ export class GatewayClient {
 
     const json = await res.json().catch(() => ({}));
     if (!res.ok) throw parseGatewayError(res.status, json);
-    return json as T;
+    return (json as { data: T }).data;
   }
 
   private async stream(path: string, body?: unknown): Promise<Response> {
