@@ -1,7 +1,6 @@
 import { RateLimitError, parseGatewayError } from './errors.js';
 
-// AI SDK Data Stream Protocol: text chunks arrive as lines prefixed `0:"..."`
-// where the value is a JSON-encoded string fragment.
+// Vercel AI SDK Data Stream Protocol: text chunks arrive as lines prefixed `0:"..."`
 const TEXT_CHUNK_RE = /^0:"((?:[^"\\]|\\.)*)"/;
 
 export interface StreamChunk {
@@ -9,8 +8,32 @@ export interface StreamChunk {
   text?: string;
 }
 
+function parseLine(trimmed: string): string | null {
+  // Bridge SSE format: data: {"type":"chunk","content":"..."}
+  if (trimmed.startsWith('data: ')) {
+    const payload = trimmed.slice(6);
+    try {
+      const parsed = JSON.parse(payload) as Record<string, unknown>;
+      if (parsed.type === 'chunk' && typeof parsed.content === 'string') {
+        return parsed.content;
+      }
+    } catch {}
+    return null;
+  }
+
+  // Vercel AI SDK format: 0:"..."
+  const match = TEXT_CHUNK_RE.exec(trimmed);
+  if (match) {
+    return JSON.parse(`"${match[1]}"`);
+  }
+
+  return null;
+}
+
 /**
- * Parse an AI SDK data-stream response into an async iterator of text chunks.
+ * Parse an SSE stream response into an async iterator of text chunks.
+ * Handles both the MS bridge format (data: {"type":"chunk","content":"..."})
+ * and the Vercel AI SDK format (0:"...").
  * Throws GatewayError subclasses on non-2xx responses.
  */
 export async function* parseDataStream(response: Response): AsyncIterable<StreamChunk> {
@@ -46,24 +69,15 @@ export async function* parseDataStream(response: Response): AsyncIterable<Stream
       for (const line of lines) {
         const trimmed = line.trim();
         if (!trimmed) continue;
-
-        const match = TEXT_CHUNK_RE.exec(trimmed);
-        if (match) {
-          // Unescape the JSON-encoded string fragment
-          const text = JSON.parse(`"${match[1]}"`);
-          yield { type: 'text', text };
-        }
-        // Ignore other data-stream line types (annotations, errors from stream, etc.)
+        const text = parseLine(trimmed);
+        if (text !== null) yield { type: 'text', text };
       }
     }
 
     // Flush remaining buffer
     if (buffer.trim()) {
-      const match = TEXT_CHUNK_RE.exec(buffer.trim());
-      if (match) {
-        const text = JSON.parse(`"${match[1]}"`);
-        yield { type: 'text', text };
-      }
+      const text = parseLine(buffer.trim());
+      if (text !== null) yield { type: 'text', text };
     }
   } finally {
     reader.releaseLock();

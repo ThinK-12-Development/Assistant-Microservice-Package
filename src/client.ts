@@ -156,7 +156,7 @@ export class GatewayClient {
             if (!streamPromise) {
               streamPromise = self
                 .stream(
-                  `/api/v1/assistants/${assistantId}/threads/${threadId}/messages/stream`,
+                  `/api/v1/threads/${threadId}/messages/stream`,
                   options,
                 )
                 .then((res) => parseDataStream(res));
@@ -180,7 +180,7 @@ export class GatewayClient {
     options: SendMessageOptions,
   ): Promise<string> {
     const res = await this.stream(
-      `/api/v1/assistants/${assistantId}/threads/${threadId}/messages/stream`,
+      `/api/v1/threads/${threadId}/messages/stream`,
       options,
     );
     return collectStream(res);
