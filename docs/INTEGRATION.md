@@ -8,7 +8,7 @@ Step-by-step instructions for integrating `@wisdomcircuits/ai-gateway-client` in
 
 Complete these before touching any code:
 
-1. **Create an API key** in the MS admin panel for this app. Give it the scopes it needs (see the [scopes table in the README](../README.md#available-api-scopes)). Note the key value — you'll only see it once.
+1. **Create an API key** in the MS admin panel for this app. At minimum, enable these scopes: `threads:write`, `messages:write`, `messages:stream`. For full gateway integration also add: `assistants:read`, `assistants:write`, `files:read`, `files:write`. Note the key value — you'll only see it once. Missing `messages:stream` is a common gotcha — thread creation will succeed but streaming will silently 403.
 2. **Note the MS base URL** — the deployed URL of the gateway microservice.
 3. **Identify the model IDs your app uses** — every model the app passes to an assistant must exist and be enabled in the MS. Model IDs use the format `provider/model-name` (e.g. `openai/gpt-4o`). Check the MS admin panel → Models to confirm. If a model your app uses is missing, add it to the MS before proceeding — migration will fail for any assistant whose model isn't found.
 
@@ -46,7 +46,9 @@ Add two nullable columns to your assistants/chatbots table:
 
 **Do not remove or modify any existing columns.** The legacy path stays active until Step 8.
 
-**Verify:** schema migration runs cleanly, all existing records unaffected.
+> **Critical:** Push/run your DB schema migration **before** starting the MS migration in Step 6. ORMs like Drizzle silently ignore writes to columns that don't exist in the DB yet — `gateway_assistant_id` saves will succeed with no error but nothing will be stored, and you'll have no record that assistants were migrated.
+
+**Verify:** schema migration runs cleanly, all existing records unaffected. Confirm the new columns exist in the DB (check the table schema directly, not just the ORM model).
 
 ---
 
@@ -138,8 +140,11 @@ app.post('/api/admin/gateway/migrate/start', requireAdmin, async (req, res) => {
             sourceId: String(a.id),
             name: a.name,
             instructions: a.instructions,
-            modelId: a.modelId, // must exist in MS — verify via diagnostics first
+            // modelId: pass as "provider/model-name" (e.g. "openai/gpt-4o") — MS resolves
+            // it to the internal UUID automatically. Must exist in MS — verify via diagnostics first.
+            modelId: a.modelId,
             description: a.description ?? undefined,
+            providerMode: 'openai_responses', // required — defaults to unbuilt "internal" path if omitted
           }))
         );
 
@@ -189,7 +194,29 @@ app.post('/api/admin/gateway/migrate/stop', requireAdmin, (req, res) => {
 
 // GET /api/admin/gateway/migrate/status
 // Poll every 2 seconds while migration is running.
-app.get('/api/admin/gateway/migrate/status', requireAdmin, (req, res) => {
+// On server restart migrationState resets to idle/empty — seed from DB so the admin UI
+// shows real state instead of a blank panel.
+app.get('/api/admin/gateway/migrate/status', requireAdmin, async (req, res) => {
+  if (migrationState.status !== 'running' && migrationState.results.length === 0) {
+    const all = await getAllAssistants();
+    const migrated = all.filter(a => !!a.gatewayAssistantId);
+    const unmigrated = all.filter(a => !a.gatewayAssistantId);
+    if (migrated.length > 0) {
+      return res.json({
+        status: unmigrated.length === 0 ? 'complete' : 'idle',
+        total: all.length,
+        succeeded: migrated.length,
+        failed: 0,
+        remaining: unmigrated.length,
+        results: migrated.map(a => ({
+          sourceId: String(a.id),
+          name: a.name,
+          gatewayAssistantId: a.gatewayAssistantId,
+          status: 'created',
+        })),
+      });
+    }
+  }
   res.json({
     status: migrationState.status,
     total: migrationState.total,
@@ -316,8 +343,9 @@ When your app creates a new assistant, also create it in the MS:
 const created = await gateway.createAssistant({
   name: input.name,
   instructions: input.instructions,
-  modelId: input.modelId, // must exist in MS
+  modelId: input.modelId, // "provider/model-name" format — MS resolves to internal UUID
   description: input.description,
+  providerMode: 'openai_responses', // required — omitting defaults to unbuilt internal path
 });
 
 await updateAssistantGatewayId(newAssistant.id, created.assistantId);
@@ -331,25 +359,41 @@ If the model doesn't exist in the MS, `createAssistant()` throws a `GatewayError
 
 ## Step 8 — Switch chat to gateway (per-assistant)
 
-In your chat handler, branch on `useGateway`:
+In your chat handler, branch on `useGateway`. Use streaming for chat UIs:
 
 ```ts
 if (assistant.useGateway && assistant.gatewayAssistantId) {
-  const thread = await getOrCreateGatewayThread(sessionId, assistant.gatewayAssistantId);
-  const result = await gateway.sendMessage(assistant.gatewayAssistantId, thread.threadId, {
+  // Thread continuity — look up existing threadId for this session, or create one.
+  // Store threadId in your DB (or a server-side Map for single-instance apps) keyed
+  // by sessionId. Never call createThread() on every message — you'll lose history.
+  let threadId = await getGatewayThreadId(sessionId); // your lookup
+  if (!threadId) {
+    const thread = await gateway.createThread(assistant.gatewayAssistantId);
+    threadId = thread.threadId;
+    await saveGatewayThreadId(sessionId, threadId); // your storage
+  }
+
+  // Streaming — chunk-by-chunk for progressive UI rendering
+  let fullText = '';
+  for await (const chunk of gateway.streamMessage(assistant.gatewayAssistantId, threadId, {
     content: message,
-  });
-  return result.message.content;
+  })) {
+    if (chunk.type === 'text') {
+      fullText += chunk.text;
+      // write to your SSE/WebSocket stream here
+    }
+  }
+  return fullText;
 } else {
   // Legacy path — unchanged
 }
 ```
 
-**Thread continuity:** store the MS `threadId` against the session in your DB. On the first message of a new session call `gateway.createThread()` and store the returned `threadId`. Reuse it for all subsequent messages in that session.
+> **Note on thread IDs:** MS threads are scoped to an assistant — `threadId` alone is enough to send messages (the MS resolves the assistant from the thread). The `assistantId` parameter passed to `streamMessage` is used for routing only and does not need to match the original creator; the thread's stored `assistantId` is the authority.
 
-Use the cutover panel to flip one assistant first.
+Use the cutover panel to flip one assistant first. Verify that assistant before touching others.
 
-**Verify:** chat works end-to-end through the gateway. Send multiple messages in the same session — confirm context is maintained. Check MS admin panel → Threads to confirm threads are being created.
+**Verify:** chat works end-to-end through the gateway. Send multiple messages in the same session — confirm context is maintained across turns. Check MS admin panel → Threads to confirm threads are being created and messages appear inside them.
 
 ---
 
@@ -364,6 +408,34 @@ Once all assistants are individually verified:
 5. Drop the old `api_key` and legacy `assistant_id` columns once confirmed unused
 
 **Verify:** all assistants chat successfully through the gateway. No references to the old API remain.
+
+---
+
+## Troubleshooting
+
+### Thread is created but chat hangs with no response
+Most likely cause: the API key is missing the `messages:stream` scope. Thread creation requires `threads:write`; streaming requires the separate `messages:stream` scope. Check the key's scopes in the MS admin panel. A 403 from the stream endpoint will manifest as a hang or empty response in the UI, not an obvious error.
+
+### Migration panel shows blank after server restart
+`migrationState` is in-memory and resets on restart. Implement the DB-seeding pattern in the status endpoint (see Step 3 above) — it reads real state from `gateway_assistant_id` values in your DB and returns that when in-memory state is empty.
+
+### `gateway_assistant_id` saves silently not persisting
+Your DB schema migration ran after the MS migration. Drizzle and similar ORMs silently drop writes to columns that don't exist in the DB yet — no error is thrown. Run `db push` / `db migrate` **before** starting the MS migration, then re-run migration for the affected assistants. Verify by reading `gateway_assistant_id` directly from the DB, not through the ORM.
+
+### Assistant responds with "not properly configured" error
+The MS `assistants.model_id` column stores an internal UUID, not the string model ID. If assistants were created before the MS's `createAssistant` handler resolved model IDs (or via a raw DB insert), rows may have stored `"openai/gpt-4o"` instead of the UUID. Fix with:
+```sql
+UPDATE assistants
+SET model_id = (SELECT id FROM llm_models WHERE model_id = 'gpt-4o' LIMIT 1)
+WHERE model_id = 'openai/gpt-4o';
+```
+Run the equivalent for any other mis-stored model strings.
+
+### Chat works in MS UI but not through the gateway client
+MS threads are tied to assistants. If the `gatewayAssistantId` in your app is stale (from a deleted and re-migrated assistant), thread creation will fail or target the wrong assistant. Re-run migration for the affected assistants to get fresh IDs, and clear any cached `threadId` values in your session store.
+
+### Models missing from MS / migration fails with model error
+Add the model in MS admin panel → Models before migrating. Migration sends `modelId` in `provider/model-name` format (e.g. `openai/gpt-4o`) — the MS resolves this to an internal UUID automatically. If you pass a UUID directly it also works. The failure mode is a `GatewayError` with code `INVALID_MODEL`.
 
 ---
 
