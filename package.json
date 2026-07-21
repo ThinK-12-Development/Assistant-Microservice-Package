@@ -1,6 +1,6 @@
 {
   "name": "@wisdomcircuits/ai-gateway-client",
-  "version": "0.1.0",
+  "version": "0.3.0",
   "description": "TypeScript client for the Wisdom Circuits AI Gateway microservice",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
