@@ -20,6 +20,8 @@ import type {
   DiagnosticsResult,
   MigrateAssistantInput,
   MigrateAssistantResult,
+  UploadFileOptions,
+  UploadFileResult,
 } from './types.js';
 
 export class GatewayClient {
@@ -252,6 +254,32 @@ export class GatewayClient {
     const json = await res.json().catch(() => ({}));
     if (!res.ok) throw parseGatewayError(res.status, json);
     return { ...(json as DiagnosticsResult), latencyMs };
+  }
+
+  // ---------------------------------------------------------------------------
+  // Files
+  // ---------------------------------------------------------------------------
+
+  async uploadFile(assistantId: string, options: UploadFileOptions): Promise<UploadFileResult> {
+    const form = new FormData();
+    const blob = options.content instanceof Blob
+      ? options.content
+      : new Blob([options.content], { type: options.mimeType ?? 'text/plain' });
+    form.append('file', blob, options.filename);
+
+    const res = await fetch(this.url(`/api/v1/assistants/${assistantId}/files`), {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${this.apiKey}` },
+      body: form,
+    });
+
+    const json = await res.json().catch(() => ({}));
+    if (!res.ok) throw parseGatewayError(res.status, json);
+    return (json as { data: { file: UploadFileResult } }).data.file;
+  }
+
+  async deleteFile(assistantId: string, fileId: string): Promise<void> {
+    await this.request<void>('DELETE', `/api/v1/assistants/${assistantId}/files/${fileId}`);
   }
 
   // ---------------------------------------------------------------------------

@@ -231,3 +231,25 @@ export interface GatewayModel {
   supportsImages: boolean;
   supportsImageGeneration: boolean;
 }
+
+// ---------------------------------------------------------------------------
+// Files
+// ---------------------------------------------------------------------------
+
+export interface UploadFileResult {
+  fileId: string;
+  filename: string;
+  originalName: string;
+  mimeType: string;
+  size: number;
+  status: string;
+}
+
+export interface UploadFileOptions {
+  /** Filename including extension — determines MIME type on the MS side. */
+  filename: string;
+  /** Raw file content as a Buffer or Blob. */
+  content: Buffer | Blob;
+  /** MIME type of the file. Defaults to 'text/plain'. */
+  mimeType?: string;
+}
