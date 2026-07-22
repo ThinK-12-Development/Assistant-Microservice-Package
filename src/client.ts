@@ -264,7 +264,7 @@ export class GatewayClient {
     const form = new FormData();
     const blob = options.content instanceof Blob
       ? options.content
-      : new Blob([options.content], { type: options.mimeType ?? 'text/plain' });
+      : new Blob([new Uint8Array(options.content as Buffer)], { type: options.mimeType ?? 'text/plain' });
     form.append('file', blob, options.filename);
 
     const res = await fetch(this.url(`/api/v1/assistants/${assistantId}/files`), {
