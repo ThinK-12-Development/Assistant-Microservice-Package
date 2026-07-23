@@ -8,23 +8,36 @@ Step-by-step instructions for integrating `@wisdomcircuits/ai-gateway-client` in
 
 Complete these before touching any code:
 
-1. **Create an API key** in the MS admin panel for this app. At minimum, enable these scopes: `threads:write`, `messages:write`, `messages:stream`. For full gateway integration also add: `assistants:read`, `assistants:write`, `files:read`, `files:write`. Note the key value — you'll only see it once. Missing `messages:stream` is a common gotcha — thread creation will succeed but streaming will silently 403.
+1. **Create an API key** in the MS admin panel for this app. Enable these scopes at minimum:
+   - `threads:write`, `messages:write`, `messages:stream` — required for chat
+   - `assistants:read`, `assistants:write` — required for migration and bot-update sync
+   - `files:read`, `files:write` — required for content source sync
+
+   Note the key value — you'll only see it once.
+
+   > **Gotcha:** `messages:stream` is a separate scope from `messages:write`. Missing it causes thread creation to succeed but streaming to hang silently with no error. Always grant both.
+
+   > **Gotcha:** `files:write` is required for content propagation (Step 10). Grant it upfront — you'll need it and forgetting it causes silent failures.
+
 2. **Note the MS base URL** — the deployed URL of the gateway microservice.
-3. **Identify the model IDs your app uses** — every model the app passes to an assistant must exist and be enabled in the MS. Model IDs use the format `provider/model-name` (e.g. `openai/gpt-4o`). Check the MS admin panel → Models to confirm. If a model your app uses is missing, add it to the MS before proceeding — migration will fail for any assistant whose model isn't found.
+
+3. **Identify the model IDs your app uses** — every model must exist and be enabled in the MS. Model IDs use the format `provider/model-name` (e.g. `openai/gpt-4o`). Check MS admin → Models. Missing models cause migration to fail per-assistant.
 
 ---
 
 ## Step 1 — Install & configure
 
-Add the package to `package.json`:
+Add the package to `package.json`, pinned to a specific git tag:
 
 ```json
-"@wisdomcircuits/ai-gateway-client": "github:ThinK-12-Development/Assistant-Microservice-Package#v0.2.0"
+"@wisdomcircuits/ai-gateway-client": "github:ThinK-12-Development/Assistant-Microservice-Package#v0.4.2"
 ```
 
 ```bash
 npm install
 ```
+
+> **Gotcha:** The package is installed from a git tag, not npm. Pushing to `main` does NOT update the installed version. You must bump the version in the package's `package.json`, create a new git tag, and update the `#tag` reference in your app's `package.json`, then re-run `npm install`. Version in `package.json` must match the tag name.
 
 Add to your environment (`.env`, Replit secrets, hosting env vars):
 
@@ -39,39 +52,51 @@ GATEWAY_API_KEY=gw_your_api_key
 
 ## Step 2 — Add gateway columns to your database
 
-Add two nullable columns to your assistants/chatbots table:
+Add these nullable columns to your assistants/chatbots table:
 
-- `gateway_assistant_id` — text, nullable, no default — stores the MS assistant ID after migration
-- `use_gateway` — boolean, default `false` — the cutover switch per assistant
+- `gateway_assistant_id` — text, nullable — stores the MS assistant ID after migration
+- `use_gateway` — boolean, default `false` — the per-assistant cutover switch
 
-**Do not remove or modify any existing columns.** The legacy path stays active until Step 8.
+Add this column to your content sources junction table (the table linking chatbots to content sources):
 
-> **Critical:** Push/run your DB schema migration **before** starting the MS migration in Step 6. ORMs like Drizzle silently ignore writes to columns that don't exist in the DB yet — `gateway_assistant_id` saves will succeed with no error but nothing will be stored, and you'll have no record that assistants were migrated.
+- `gateway_file_id` — text, nullable — stores the MS file ID after upload
 
-**Verify:** schema migration runs cleanly, all existing records unaffected. Confirm the new columns exist in the DB (check the table schema directly, not just the ORM model).
+> **Critical:** Push/run your DB schema migration **before** starting the MS migration in Step 6. ORMs like Drizzle silently ignore writes to columns that don't exist in the DB yet — no error is thrown but nothing is stored.
+
+**Verify:** migration runs cleanly. Confirm columns exist by reading the DB schema directly.
 
 ---
 
-## Step 3 — Add server-side admin endpoints
+## Step 3 — Create a shared GatewayClient instance
 
-These endpoints are the plumbing your admin UI (Step 4) will call. Add all of them before building the UI.
+Create one shared `GatewayClient` instance at module load. Do **not** instantiate it lazily inside each route handler — this causes repeated object creation and makes it harder to guard against missing env vars.
+
+```ts
+import { GatewayClient } from "@wisdomcircuits/ai-gateway-client";
+
+const gatewayClient = process.env.GATEWAY_URL && process.env.GATEWAY_API_KEY
+  ? new GatewayClient({ baseUrl: process.env.GATEWAY_URL, apiKey: process.env.GATEWAY_API_KEY })
+  : null;
+```
+
+Guard every gateway call with a null check (`if (gatewayClient && ...)`) so the app starts and works even if env vars are missing.
+
+---
+
+## Step 4 — Add server-side admin endpoints
+
+These endpoints are the plumbing your admin UI (Step 5) will call.
 
 All endpoints must be behind your app's admin authentication middleware.
 
-> **Error logging requirement:** The migration runs in a background `setImmediate` loop. Wrap the entire loop in a try/catch and log errors to the server console — failures will not surface to the UI otherwise. See [Troubleshooting](./TROUBLESHOOTING.md) for the logging pattern.
+> **Error logging requirement:** The migration runs in a background `setImmediate` loop. Wrap the entire loop in a try/catch and log errors to the server console — failures will not surface to the UI otherwise.
 
 ```ts
-import { GatewayClient } from '@wisdomcircuits/ai-gateway-client';
-
-const gateway = new GatewayClient({
-  baseUrl: process.env.GATEWAY_URL!,
-  apiKey: process.env.GATEWAY_API_KEY!,
-});
-
 // GET /api/admin/gateway/ping
 app.get('/api/admin/gateway/ping', requireAdmin, async (req, res) => {
+  if (!gatewayClient) return res.status(503).json({ ok: false, error: 'Gateway not configured' });
   try {
-    const result = await gateway.ping();
+    const result = await gatewayClient.ping();
     res.json(result);
   } catch (err: any) {
     res.status(500).json({ ok: false, error: err.message });
@@ -80,8 +105,9 @@ app.get('/api/admin/gateway/ping', requireAdmin, async (req, res) => {
 
 // GET /api/admin/gateway/diagnostics
 app.get('/api/admin/gateway/diagnostics', requireAdmin, async (req, res) => {
+  if (!gatewayClient) return res.status(503).json({ ok: false, error: 'Gateway not configured' });
   try {
-    const result = await gateway.diagnostics();
+    const result = await gatewayClient.diagnostics();
     res.json(result);
   } catch (err: any) {
     res.status(500).json({ ok: false, error: err.message });
@@ -89,7 +115,6 @@ app.get('/api/admin/gateway/diagnostics', requireAdmin, async (req, res) => {
 });
 
 // Migration state — in-memory for single-instance deployments.
-// For multi-instance deployments, move to your DB or Redis.
 let migrationState: {
   status: 'idle' | 'running' | 'stopped' | 'complete';
   total: number;
@@ -103,48 +128,34 @@ const BATCH_SIZE = 5;
 const BATCH_DELAY_MS = 500;
 
 // POST /api/admin/gateway/migrate/start
-// Starts batched migration in the background. Returns immediately.
-// Idempotent — skips already migrated assistants. Resume after stop by calling again.
 app.post('/api/admin/gateway/migrate/start', requireAdmin, async (req, res) => {
+  if (!gatewayClient) return res.status(503).json({ ok: false, error: 'Gateway not configured' });
   if (migrationState.status === 'running') {
     return res.json({ ok: false, message: 'Migration already in progress.' });
   }
 
-  const unmigrated = await getUnmigratedAssistants();
+  const unmigrated = await getUnmigratedAssistants(); // only those without gateway_assistant_id
   if (unmigrated.length === 0) {
     return res.json({ ok: true, message: 'All assistants already migrated.', total: 0 });
   }
 
-  migrationState = {
-    status: 'running',
-    total: unmigrated.length,
-    succeeded: 0,
-    failed: 0,
-    results: [],
-    stopRequested: false,
-  };
-
+  migrationState = { status: 'running', total: unmigrated.length, succeeded: 0, failed: 0, results: [], stopRequested: false };
   res.json({ ok: true, message: 'Migration started.', total: unmigrated.length });
 
   setImmediate(async () => {
     try {
       for (let i = 0; i < unmigrated.length; i += BATCH_SIZE) {
-        if (migrationState.stopRequested) {
-          migrationState.status = 'stopped';
-          break;
-        }
+        if (migrationState.stopRequested) { migrationState.status = 'stopped'; break; }
 
         const batch = unmigrated.slice(i, i + BATCH_SIZE);
-        const batchResults = await gateway.migrate(
+        const batchResults = await gatewayClient!.migrate(
           batch.map(a => ({
             sourceId: String(a.id),
             name: a.name,
             instructions: a.instructions,
-            // modelId: pass as "provider/model-name" (e.g. "openai/gpt-4o") — MS resolves
-            // it to the internal UUID automatically. Must exist in MS — verify via diagnostics first.
-            modelId: a.modelId,
+            modelId: a.modelId, // "provider/model-name" format e.g. "openai/gpt-4o"
             description: a.description ?? undefined,
-            providerMode: 'openai_responses', // required — defaults to unbuilt "internal" path if omitted
+            providerMode: 'openai_responses', // REQUIRED — omitting defaults to unbuilt internal path
           }))
         );
 
@@ -164,26 +175,15 @@ app.post('/api/admin/gateway/migrate/start', requireAdmin, async (req, res) => {
           await new Promise(resolve => setTimeout(resolve, BATCH_DELAY_MS));
         }
       }
-
-      if (migrationState.status === 'running') {
-        migrationState.status = 'complete';
-      }
+      if (migrationState.status === 'running') migrationState.status = 'complete';
     } catch (err) {
       console.error('[migration] Fatal error in background loop:', err);
       migrationState.status = 'stopped';
-      migrationState.results.push({
-        sourceId: 'unknown',
-        name: 'unknown',
-        gatewayAssistantId: null,
-        status: 'failed',
-        error: err instanceof Error ? err.message : String(err),
-      });
     }
   });
 });
 
 // POST /api/admin/gateway/migrate/stop
-// Graceful halt — completes current batch then stops.
 app.post('/api/admin/gateway/migrate/stop', requireAdmin, (req, res) => {
   if (migrationState.status !== 'running') {
     return res.json({ ok: false, message: 'No migration is currently running.' });
@@ -193,9 +193,7 @@ app.post('/api/admin/gateway/migrate/stop', requireAdmin, (req, res) => {
 });
 
 // GET /api/admin/gateway/migrate/status
-// Poll every 2 seconds while migration is running.
-// On server restart migrationState resets to idle/empty — seed from DB so the admin UI
-// shows real state instead of a blank panel.
+// Seed from DB on restart so UI shows real state instead of blank panel.
 app.get('/api/admin/gateway/migrate/status', requireAdmin, async (req, res) => {
   if (migrationState.status !== 'running' && migrationState.results.length === 0) {
     const all = await getAllAssistants();
@@ -208,12 +206,7 @@ app.get('/api/admin/gateway/migrate/status', requireAdmin, async (req, res) => {
         succeeded: migrated.length,
         failed: 0,
         remaining: unmigrated.length,
-        results: migrated.map(a => ({
-          sourceId: String(a.id),
-          name: a.name,
-          gatewayAssistantId: a.gatewayAssistantId,
-          status: 'created',
-        })),
+        results: migrated.map(a => ({ sourceId: String(a.id), name: a.name, gatewayAssistantId: a.gatewayAssistantId, status: 'created' })),
       });
     }
   }
@@ -228,28 +221,18 @@ app.get('/api/admin/gateway/migrate/status', requireAdmin, async (req, res) => {
 });
 
 // GET /api/admin/gateway/assistants?page=1&limit=25&search=
-// Paginated assistant list with migration status.
 app.get('/api/admin/gateway/assistants', requireAdmin, async (req, res) => {
   try {
     const page = Math.max(1, parseInt(req.query.page as string) || 1);
     const limit = Math.min(100, parseInt(req.query.limit as string) || 25);
     const search = (req.query.search as string)?.toLowerCase() ?? '';
     const offset = (page - 1) * limit;
-
     let assistants = await getAllAssistants();
     if (search) assistants = assistants.filter(a => a.name.toLowerCase().includes(search));
     const total = assistants.length;
     const paged = assistants.slice(offset, offset + limit);
-
     res.json({
-      data: paged.map(a => ({
-        id: a.id,
-        name: a.name,
-        modelId: a.modelId,
-        gatewayAssistantId: a.gatewayAssistantId ?? null,
-        useGateway: a.useGateway ?? false,
-        migrated: !!a.gatewayAssistantId,
-      })),
+      data: paged.map(a => ({ id: a.id, name: a.name, modelId: a.modelId, gatewayAssistantId: a.gatewayAssistantId ?? null, useGateway: a.useGateway ?? false, migrated: !!a.gatewayAssistantId })),
       pagination: { page, limit, total, totalPages: Math.ceil(total / limit) },
     });
   } catch (err: any) {
@@ -258,7 +241,6 @@ app.get('/api/admin/gateway/assistants', requireAdmin, async (req, res) => {
 });
 
 // PATCH /api/admin/gateway/assistants/:id/toggle
-// Per-assistant cutover switch.
 app.patch('/api/admin/gateway/assistants/:id/toggle', requireAdmin, async (req, res) => {
   try {
     const { id } = req.params;
@@ -271,187 +253,280 @@ app.patch('/api/admin/gateway/assistants/:id/toggle', requireAdmin, async (req, 
 });
 ```
 
-**Verify:** all seven endpoints respond correctly when called directly.
+**Verify:** all endpoints respond correctly when called directly.
 
 ---
 
-## Step 4 — Build the gateway admin UI page
+## Step 5 — Build the gateway admin UI page
 
-Build an admin-only page at `/admin/gateway` (or wherever admin pages live in this app). Build it before running migration — you need it to monitor progress and act on errors.
+Build an admin-only page at `/admin/gateway`. The page has four sections:
 
-The page has four sections:
+**1. Connection status** — calls ping and diagnostics on load. Display: green/red indicator, latency, key name, scopes list, models list. Show warnings for missing scopes.
 
-**1. Connection status**
-Calls `GET /api/admin/gateway/ping` and `GET /api/admin/gateway/diagnostics` on load.
-Display: connection indicator (green/red), latency, key name, scopes list, available models list. Show warnings for any missing scopes.
+**2. Pre-flight model check** — compare assistant models against MS models. Table: assistant | model | present in MS (✅/❌). Block Start Migration if any model is missing.
 
-**2. Pre-flight model check**
-Compare the models your app's assistants use against the models from diagnostics.
-Table: assistant name | model it uses | present in MS (✅/❌).
-If any model is missing: red warning with model name and instruction to add it in the MS admin panel. Block the Start Migration button until all models are present.
+**3. Migration panel** — paginated assistant list (25/page, searchable). Table: name | migrated | gateway ID | error. Controls: Start/Resume, Stop. Poll status every 2s while running.
 
-**3. Migration panel**
-Calls `GET /api/admin/gateway/assistants?page=1&limit=25` — paginated with search. Do not load all at once; apps may have 150+ assistants.
-Table: name | migrated (✅/❌) | gateway assistant ID | error if failed.
+**4. Cutover panel** — paginated table of migrated assistants with `use_gateway` toggle per row. "Switch all to Gateway" button disabled until at least one assistant has been individually verified.
 
-Controls:
-- **Start / Resume** — calls `POST /api/admin/gateway/migrate/start`. Skips already migrated assistants. Disabled if any models are missing.
-- **Stop** — calls `POST /api/admin/gateway/migrate/stop`. Visible only while status is `running`. Halts after current batch.
-
-While running, poll `GET /api/admin/gateway/migrate/status` every 2 seconds. Update: progress bar (X of Y), counts (succeeded / failed / remaining), per-assistant results table as batches complete. Stop polling when status is `complete` or `stopped`.
-
-**4. Cutover panel**
-Paginated table (25/page, searchable) of migrated assistants with their `use_gateway` state.
-Summary: "X of Y assistants on gateway."
-Each row has a toggle button — "Switch to Gateway" / "Switch to Legacy" — calling `PATCH /api/admin/gateway/assistants/:id/toggle`. Updates only that row without reload.
-"Switch all to Gateway" button — disabled until at least one assistant has been individually toggled on. This prevents accidental bulk cutover before any testing.
-
-**Verify:** page loads, connection shows green, model check populates, migration panel shows all assistants.
-
----
-
-## Step 5 — Verify connection & pre-flight
-
-Using the admin UI:
-
-1. Confirm ping returns green
-2. Confirm diagnostics shows correct scopes
-3. Confirm all models your assistants use appear in the MS model list — add any missing ones before continuing
-
-**Verify:** all models present, no warnings.
+**Verify:** page loads, connection is green, model check populates, all assistants listed.
 
 ---
 
 ## Step 6 — Migrate existing assistants
 
-Using the migration panel:
+1. Click **Start** in the migration panel
+2. Watch progress in real time
+3. If failures appear, click **Stop**, fix the root cause, click **Start** again — already migrated assistants are skipped
+4. Most common failure: model not in MS — add it in MS admin → Models then resume
 
-1. Click **Start** — migration begins in background, 5 assistants per batch
-2. Watch progress update in real time
-3. If you spot a pattern in failures, click **Stop** — halts after current batch. Fix the root cause, then **Start** again to resume. Already migrated assistants are skipped.
-4. Failed items show the error — most common cause is a model not found in the MS. Add the model and resume.
-
-**Verify:** all assistants show migrated with a gateway assistant ID. Confirm they appear in MS admin panel → Assistants.
+**Verify:** all assistants show a gateway assistant ID. Confirm they appear in MS admin → Assistants.
 
 ---
 
 ## Step 7 — Wire new assistant creation through the gateway
 
-When your app creates a new assistant, also create it in the MS:
+When your app creates a new assistant, also create it in the MS immediately:
 
 ```ts
-const created = await gateway.createAssistant({
+const created = await gatewayClient.createAssistant({
   name: input.name,
   instructions: input.instructions,
-  modelId: input.modelId, // "provider/model-name" format — MS resolves to internal UUID
+  modelId: `openai/${input.model}`, // "provider/model-name" format
   description: input.description,
-  providerMode: 'openai_responses', // required — omitting defaults to unbuilt internal path
+  providerMode: 'openai_responses', // REQUIRED
 });
 
 await updateAssistantGatewayId(newAssistant.id, created.assistantId);
+await updateAssistantUseGateway(newAssistant.id, true); // new bots go straight to gateway
 ```
-
-If the model doesn't exist in the MS, `createAssistant()` throws a `GatewayError` — surface this to the admin as "Model X not found in gateway — add it in the MS admin panel."
 
 **Verify:** create a new assistant, confirm `gateway_assistant_id` is populated and it appears in MS admin.
 
 ---
 
-## Step 8 — Switch chat to gateway (per-assistant)
+## Step 8 — Propagate bot updates to the MS
 
-In your chat handler, branch on `useGateway`. Use streaming for chat UIs:
+Every place in your app that updates a bot must also sync to the MS. This is not optional — the MS stores its own copy of the assistant's name, description, instructions, and model, and uses them on every request. If you don't sync, the MS will serve stale data.
+
+Four update vectors to cover:
+
+**1. Name + description** (wherever the bot's basic info is edited):
+```ts
+if (gatewayClient && bot.useGateway && bot.gatewayAssistantId) {
+  const patch: Record<string, string> = {};
+  if (name) patch.name = name;
+  if (description) patch.description = description;
+  if (Object.keys(patch).length > 0) {
+    gatewayClient.updateAssistant(bot.gatewayAssistantId, patch)
+      .catch(err => console.error('[gateway] updateAssistant failed:', err.message));
+  }
+}
+```
+
+**2. System instructions** (wherever instructions/prompt is edited):
+```ts
+if (gatewayClient && bot.useGateway && bot.gatewayAssistantId) {
+  gatewayClient.updateAssistant(bot.gatewayAssistantId, { instructions: systemInstructions })
+    .catch(err => console.error('[gateway] updateAssistant failed:', err.message));
+}
+```
+
+> **Critical gotcha:** Do NOT fetch instructions from OpenAI before updating them. The MS uses the OpenAI Responses API which does NOT store instructions on an assistant object — instructions are passed per-request from the MS DB. Fetching from OpenAI for a gateway bot will return nothing and silently overwrite your instructions with an empty string.
+>
+> Gate any legacy OpenAI fetch/push behind `if (!bot.useGateway)`:
+> ```ts
+> if (!bot.useGateway) {
+>   // legacy OpenAI path
+> }
+> ```
+
+**3. Model changes** (wherever the global or per-bot model is changed):
+```ts
+// Model IDs in MS use "provider/model-name" format
+const msModelId = `openai/${newModel}`; // adjust prefix for non-OpenAI models
+for (const bot of gatewayBots) {
+  gatewayClient.updateAssistant(bot.gatewayAssistantId, { modelId: msModelId })
+    .catch(err => console.error('[gateway] model update failed:', err.message));
+}
+```
+
+All gateway sync calls should be fire-and-forget (`.catch` logs the error but does not fail the user-facing request). The user's update succeeds even if the MS sync fails — but log it so you can detect and fix connectivity issues.
+
+**Verify:** update name, description, instructions, and model on a gateway bot. Confirm changes appear in MS admin → the assistant's detail page.
+
+---
+
+## Step 9 — Wire chat to the gateway
+
+In your chat handler, branch on `useGateway`:
 
 ```ts
-if (assistant.useGateway && assistant.gatewayAssistantId) {
-  // Thread continuity — look up existing threadId for this session, or create one.
-  // Store threadId in your DB (or a server-side Map for single-instance apps) keyed
-  // by sessionId. Never call createThread() on every message — you'll lose history.
-  let threadId = await getGatewayThreadId(sessionId); // your lookup
+if (bot.useGateway && bot.gatewayAssistantId) {
+  // Thread continuity — reuse threadId across messages in the same session
+  // Never call createThread() on every message — you'll lose conversation history
+  let threadId = getGatewayThreadId(sessionId); // your lookup (Map, DB, Redis)
   if (!threadId) {
-    const thread = await gateway.createThread(assistant.gatewayAssistantId);
+    const thread = await gatewayClient.createThread(bot.gatewayAssistantId);
     threadId = thread.threadId;
-    await saveGatewayThreadId(sessionId, threadId); // your storage
+    saveGatewayThreadId(sessionId, threadId);
   }
 
-  // Streaming — chunk-by-chunk for progressive UI rendering
+  // Streaming
   let fullText = '';
-  for await (const chunk of gateway.streamMessage(assistant.gatewayAssistantId, threadId, {
-    content: message,
-  })) {
+  for await (const chunk of gatewayClient.streamMessage(bot.gatewayAssistantId, threadId, { content: message })) {
     if (chunk.type === 'text') {
       fullText += chunk.text;
-      // write to your SSE/WebSocket stream here
+      // write to your SSE/WebSocket stream
     }
   }
   return fullText;
 } else {
-  // Legacy path — unchanged
+  // legacy path — unchanged
 }
 ```
 
-> **Note on thread IDs:** MS threads are scoped to an assistant — `threadId` alone is enough to send messages (the MS resolves the assistant from the thread). The `assistantId` parameter passed to `streamMessage` is used for routing only and does not need to match the original creator; the thread's stored `assistantId` is the authority.
+Use the cutover panel to flip one bot at a time. Verify each before switching more.
 
-Use the cutover panel to flip one assistant first. Verify that assistant before touching others.
-
-**Verify:** chat works end-to-end through the gateway. Send multiple messages in the same session — confirm context is maintained across turns. Check MS admin panel → Threads to confirm threads are being created and messages appear inside them.
+**Verify:** chat works end-to-end. Send multiple messages in one session — confirm context is maintained. Check MS admin → Threads to confirm threads and messages appear.
 
 ---
 
-## Step 9 — Full cutover & cleanup
+## Step 10 — Propagate content source changes to the MS
 
-Once all assistants are individually verified:
+When a content source (file, URL, or manual text) is attached to or removed from a bot, the MS assistant's file store must be kept in sync. The MS uses a vector store per assistant — it syncs files on the first message after upload, so there is a one-time latency cost on the first chat after a new file is added. For bots with many files added before any chat, this latency can be significant (see Troubleshooting).
+
+**Schema requirement:** your content source junction table needs a `gateway_file_id` column (text, nullable) to track the MS file ID per mapping. Add it in Step 2 alongside the other columns.
+
+Also add these methods to your storage layer (adapt to your ORM):
+- `updateContentSourceMapping(botId, contentSourceId, { gatewayFileId })` — store the file ID after upload
+- `getContentSourceMapping(botId, contentSourceId)` — retrieve a mapping (to get `gatewayFileId` before delete)
+- `getChatbotContentSourceMappings(contentSourceId)` — get all mappings for a source (for cascade delete)
+
+**On attach** (`POST /api/chatbots/:id/content-sources`):
+```ts
+// After the DB mapping is created:
+if (gatewayClient && bot.useGateway && bot.gatewayAssistantId
+    && contentSource.processingStatus === 'processed' && contentSource.content) {
+  const filename = `${contentSource.contentType}-${contentSource.name.replace(/[^a-zA-Z0-9]/g, '-').toLowerCase()}.txt`;
+  gatewayClient.uploadFile(bot.gatewayAssistantId, {
+    filename,
+    content: Buffer.from(contentSource.content, 'utf-8'),
+    mimeType: 'text/plain',
+  }).then(result => storage.updateContentSourceMapping(bot.id, contentSource.id, { gatewayFileId: result.fileId }))
+    .catch(err => console.error('[gateway] uploadFile failed:', err.message));
+}
+```
+
+> **Note:** Upload only fires if `processingStatus === 'processed'` and `content` is populated. Content sources that are still pending/processing at attach time will NOT be uploaded. Backfill by detaching and re-attaching once processing completes, or retrigger scraping from the admin.
+
+**On detach** (`DELETE /api/chatbots/:id/content-sources/:contentSourceId`):
+```ts
+// Before removing the DB mapping — retrieve the gatewayFileId first:
+if (gatewayClient && bot.useGateway && bot.gatewayAssistantId) {
+  const mapping = await storage.getContentSourceMapping(bot.id, contentSourceId);
+  if (mapping?.gatewayFileId) {
+    gatewayClient.deleteFile(bot.gatewayAssistantId, mapping.gatewayFileId)
+      .catch(err => console.error('[gateway] deleteFile failed:', err.message));
+  }
+}
+await storage.removeContentSourceFromChatbot(bot.id, contentSourceId);
+```
+
+**On content source delete** (`DELETE /api/content-sources/:id`):
+```ts
+// Cascade-delete from MS for all bots that have this source mapped:
+if (gatewayClient) {
+  const mappings = await storage.getChatbotContentSourceMappings(id);
+  for (const m of mappings) {
+    if (!m.gatewayFileId) continue;
+    const bot = await storage.getChatbot(m.botId);
+    if (bot?.useGateway && bot.gatewayAssistantId) {
+      gatewayClient.deleteFile(bot.gatewayAssistantId, m.gatewayFileId)
+        .catch(err => console.error('[gateway] deleteFile (cascade) failed:', err.message));
+    }
+  }
+}
+await storage.deleteContentSource(id);
+```
+
+**Verify:** attach a processed content source to a gateway bot. Ask the bot a question only that source would know. Confirm it answers correctly. Check MS admin → the assistant's files section — the file should appear after the first message is sent.
+
+---
+
+## Step 11 — Full cutover & cleanup
+
+Once all bots are individually verified on the gateway:
 
 1. Use "Switch all to Gateway" in the cutover panel
-2. Monitor for errors over a verification period
+2. Monitor for errors
 3. Once stable, remove the legacy chat branch
 4. Remove the legacy AI SDK / direct OpenAI dependency
-5. Drop the old `api_key` and legacy `assistant_id` columns once confirmed unused
-
-**Verify:** all assistants chat successfully through the gateway. No references to the old API remain.
+5. Drop old legacy-only columns once confirmed unused
 
 ---
 
 ## Troubleshooting
 
 ### Thread is created but chat hangs with no response
-Most likely cause: the API key is missing the `messages:stream` scope. Thread creation requires `threads:write`; streaming requires the separate `messages:stream` scope. Check the key's scopes in the MS admin panel. A 403 from the stream endpoint will manifest as a hang or empty response in the UI, not an obvious error.
+The API key is missing `messages:stream` scope. Thread creation (`threads:write`) and streaming (`messages:stream`) are separate scopes — missing the latter causes a silent 403 on the stream endpoint that manifests as a hang. Check scopes in MS admin → API Keys.
+
+### Chat hangs even with correct scopes
+The package's stream URL or SSE format may be wrong. The MS stream endpoint is `/api/v1/threads/:threadId/messages/stream` (no `/assistants/:id/` prefix). The MS SSE format is `data: {"type":"chunk","content":"..."}` / `data: {"type":"done",...}` — not the Vercel AI SDK `0:"text"` format. Verify the installed package version handles both.
 
 ### Migration panel shows blank after server restart
-`migrationState` is in-memory and resets on restart. Implement the DB-seeding pattern in the status endpoint (see Step 3 above) — it reads real state from `gateway_assistant_id` values in your DB and returns that when in-memory state is empty.
+`migrationState` is in-memory and resets on restart. Use the DB-seeding pattern in the status endpoint (see Step 4) to read real state from `gateway_assistant_id` values.
 
 ### `gateway_assistant_id` saves silently not persisting
-Your DB schema migration ran after the MS migration. Drizzle and similar ORMs silently drop writes to columns that don't exist in the DB yet — no error is thrown. Run `db push` / `db migrate` **before** starting the MS migration, then re-run migration for the affected assistants. Verify by reading `gateway_assistant_id` directly from the DB, not through the ORM.
+DB schema migration ran after migration started. Drizzle silently drops writes to columns that don't exist yet. Run `db push` **before** starting migration. Verify by reading the column directly in the DB, not through the ORM.
 
-### Assistant responds with "not properly configured" error
-The MS `assistants.model_id` column stores an internal UUID, not the string model ID. If assistants were created before the MS's `createAssistant` handler resolved model IDs (or via a raw DB insert), rows may have stored `"openai/gpt-4o"` instead of the UUID. Fix with:
+### Gateway bot returns stale instructions after update
+The legacy path was fetching instructions from OpenAI before saving (to merge/display them). For gateway bots this fetch returns nothing — the Responses API doesn't store instructions on assistant objects. Gate any OpenAI instruction fetch/push behind `if (!bot.useGateway)`.
+
+### Content source attached but bot doesn't know about it
+Upload only fires if the content source has `processingStatus === 'processed'` and `content` populated at the moment of attach. If the source was still processing when attached, the upload was skipped. Detach and re-attach once processing is complete, or retrigger scraping from the admin panel.
+
+### First message after new file is very slow
+Expected behavior. The MS syncs files to OpenAI's vector store on the first message after a new file is uploaded, not at upload time. For bots with many files added before any chat, this can cause significant latency on that first message. It's a one-time cost per file — subsequent messages are fast. A future MS improvement will trigger the sync at upload time to eliminate this.
+
+### Models missing from MS / migration fails with model error
+Add the model in MS admin → Models before migrating. Migration sends `modelId` in `provider/model-name` format — the MS resolves it to an internal UUID. The failure mode is a `GatewayError` with code `INVALID_MODEL`.
+
+### Bot appears in MS but `assistant.model_id` column has a string instead of a UUID
+If assistants were migrated before model resolution was working correctly, the `model_id` column in the MS DB may contain `"openai/gpt-4o"` instead of the UUID. Fix with:
 ```sql
 UPDATE assistants
 SET model_id = (SELECT id FROM llm_models WHERE model_id = 'gpt-4o' LIMIT 1)
 WHERE model_id = 'openai/gpt-4o';
 ```
-Run the equivalent for any other mis-stored model strings.
 
-### Chat works in MS UI but not through the gateway client
-MS threads are tied to assistants. If the `gatewayAssistantId` in your app is stale (from a deleted and re-migrated assistant), thread creation will fail or target the wrong assistant. Re-run migration for the affected assistants to get fresh IDs, and clear any cached `threadId` values in your session store.
-
-### Models missing from MS / migration fails with model error
-Add the model in MS admin panel → Models before migrating. Migration sends `modelId` in `provider/model-name` format (e.g. `openai/gpt-4o`) — the MS resolves this to an internal UUID automatically. If you pass a UUID directly it also works. The failure mode is a `GatewayError` with code `INVALID_MODEL`.
+### Package won't install / TypeScript build errors
+The package requires `@types/node` as a dev dependency and must be built before install. If you see `Cannot find name 'Buffer'` or `Buffer is not assignable to BlobPart`, the installed package tag is missing the fix — update to `v0.4.2` or later.
 
 ---
 
 ## Integration complete checklist
 
-- [ ] API key created in MS admin with correct scopes
+- [ ] API key created with all required scopes (`threads:write`, `messages:write`, `messages:stream`, `assistants:read`, `assistants:write`, `files:read`, `files:write`)
 - [ ] All app models confirmed present in MS
-- [ ] Package installed, env vars set
-- [ ] DB columns added (`gateway_assistant_id`, `use_gateway`)
-- [ ] All seven server-side admin endpoints added and responding
-- [ ] Gateway admin UI page built with all four sections
+- [ ] Package installed and pinned to a specific git tag
+- [ ] Env vars set (`GATEWAY_URL`, `GATEWAY_API_KEY`)
+- [ ] DB columns added: `gateway_assistant_id`, `use_gateway` on assistants table; `gateway_file_id` on content sources junction table
+- [ ] DB migration run before any MS operations
+- [ ] Shared `GatewayClient` instance created (not lazy per-route)
+- [ ] All admin endpoints added and responding
+- [ ] Gateway admin UI built (connection, model check, migration panel, cutover panel)
 - [ ] `ping()` returns `ok: true`
 - [ ] `diagnostics()` shows correct scopes and all required models
-- [ ] All existing assistants migrated (start/stop/resume verified, no failures)
-- [ ] New assistant creation writes `gateway_assistant_id`
+- [ ] All existing assistants migrated with no failures
+- [ ] New assistant creation writes `gateway_assistant_id` and sets `use_gateway: true`
+- [ ] Bot update sync wired for: name/description, instructions, model
+- [ ] Legacy OpenAI instruction fetch/push gated on `!useGateway`
 - [ ] Chat handler branching on `use_gateway`
 - [ ] Thread continuity verified across multi-message sessions
-- [ ] All assistants on gateway path
+- [ ] Content source attach uploads file to MS and stores `gateway_file_id`
+- [ ] Content source detach deletes file from MS
+- [ ] Content source delete cascade-deletes from MS for all mapped bots
+- [ ] Content knowledge verified end-to-end (bot answers from attached source)
+- [ ] All bots on gateway path
 - [ ] Legacy dependency removed
