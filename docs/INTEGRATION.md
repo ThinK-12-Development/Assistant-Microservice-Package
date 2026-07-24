@@ -388,6 +388,15 @@ if (bot.useGateway && bot.gatewayAssistantId) {
 
 Use the cutover panel to flip one bot at a time. Verify each before switching more.
 
+> **Thread storage — choose the right approach for your app:**
+>
+> - **Open-access app (no login):** Store `threadId` in a server-side `Map<sessionId, threadId>`. Threads reset on server restart, which is acceptable because there's no user identity to anchor persistence to anyway.
+> - **Authenticated app:** Store `threadId` in your DB keyed to `userId + botId`. This preserves conversation history across sessions and server restarts. On login, look up the existing thread; only call `createThread()` if none exists.
+>
+> Never call `createThread()` on every message regardless of approach — each call starts a fresh conversation with no history.
+
+> **Model ID format:** Your app may store model names differently from what the MS expects. The MS requires `provider/model-name` format (e.g. `openai/gpt-4o`). If your app stores just `gpt-4o`, transform it at the call site: `` `openai/${bot.model}` ``. Check your app's model storage format before wiring chat — a format mismatch fails silently by using the wrong model or throwing a `INVALID_MODEL` error.
+
 **Verify:** chat works end-to-end. Send multiple messages in one session — confirm context is maintained. Check MS admin → Threads to confirm threads and messages appear.
 
 ---
@@ -499,6 +508,9 @@ UPDATE assistants
 SET model_id = (SELECT id FROM llm_models WHERE model_id = 'gpt-4o' LIMIT 1)
 WHERE model_id = 'openai/gpt-4o';
 ```
+
+### Vector store not visible in my OpenAI dashboard
+The MS creates and manages the OpenAI vector store using its own OpenAI API key, not your app's key. The vector store will not appear in your app's OpenAI project — look in the MS's OpenAI account instead. This is expected behavior.
 
 ### Package won't install / TypeScript build errors
 The package requires `@types/node` as a dev dependency and must be built before install. If you see `Cannot find name 'Buffer'` or `Buffer is not assignable to BlobPart`, the installed package tag is missing the fix — update to `v0.4.2` or later.
