@@ -35,4 +35,10 @@ export type {
   DiagnosticsResult,
   MigrateAssistantInput,
   MigrateAssistantResult,
+  UploadFileOptions,
+  UploadFileResult,
+  BackfillFileItem,
+  BackfillFileResult,
+  BackfillOptions,
+  BackfillSummary,
 } from './types.js';

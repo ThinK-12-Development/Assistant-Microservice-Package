@@ -463,6 +463,159 @@ await storage.deleteContentSource(id);
 
 ---
 
+## Step 10b — Wire processing-completion uploads (Option 2)
+
+The attach hook in Step 10 only fires when content is already `processed` at attach time. If a content source is attached while still processing, or is re-scraped after being attached, the gateway never receives the updated content.
+
+Fix this by hooking the point in your app where `processingStatus` flips to `processed`. After the status update, check all chatbot mappings for that source and upload to any gateway bots missing a `gatewayFileId`:
+
+```ts
+// After contentSource.processingStatus is set to 'processed':
+if (gatewayClient && contentSource.content) {
+  const mappings = await storage.getChatbotContentSourceMappings(contentSource.id);
+  const needsUpload = mappings.filter(m => !m.gatewayFileId);
+
+  for (const m of needsUpload) {
+    const bot = await storage.getChatbot(m.botId);
+    if (!bot?.useGateway || !bot.gatewayAssistantId) continue;
+
+    const filename = `${contentSource.contentType}-${contentSource.name.replace(/[^a-zA-Z0-9]/g, '-').toLowerCase()}.txt`;
+    gatewayClient.uploadFile(bot.gatewayAssistantId, {
+      filename,
+      content: Buffer.from(contentSource.content, 'utf-8'),
+      mimeType: 'text/plain',
+    }).then(result => storage.updateContentSourceMapping(m.botId, contentSource.id, { gatewayFileId: result.fileId }))
+      .catch(err => console.error('[gateway] post-processing uploadFile failed:', err.message));
+  }
+}
+```
+
+This runs fire-and-forget per bot — a failure on one doesn't block the others.
+
+**Verify:** attach a content source that is still pending, wait for it to process, then ask the bot a question from that content. Confirm it answers without needing a detach/re-attach.
+
+---
+
+## Step 10c — Backfill existing content source mappings
+
+When the gateway is first integrated into an app that already has content sources linked to bots, those existing mappings have no `gatewayFileId` and their content is unknown to the MS. This backfill step syncs them.
+
+The package provides `gatewayClient.backfillFiles()` for this — it handles batching, rate limiting, per-item progress callbacks, and stop/resume. Your app is responsible for querying which items to backfill and how targeted that scope is.
+
+### Targeting approaches
+
+Use whichever scope fits the situation:
+
+**By bot** — sync all unsynced content for a specific bot (best for testing one bot before rolling out):
+```ts
+const bot = await storage.getChatbot(botId);
+const sources = await storage.getContentSourcesForChatbot(botId);
+const items = [];
+for (const src of sources) {
+  if (!src.content || src.processingStatus !== 'processed') continue;
+  const mapping = await storage.getContentSourceMapping(botId, src.id);
+  if (mapping?.gatewayFileId) continue; // already synced
+  items.push({
+    sourceId: `${botId}:${src.id}`,
+    assistantId: bot.gatewayAssistantId,
+    filename: `${src.contentType}-${src.name.replace(/[^a-zA-Z0-9]/g, '-').toLowerCase()}.txt`,
+    content: Buffer.from(src.content, 'utf-8'),
+  });
+}
+```
+
+**By content source** — sync all bots that use a specific source (best after a rescrape):
+```ts
+const src = await storage.getContentSource(contentSourceId);
+const mappings = await storage.getChatbotContentSourceMappings(contentSourceId);
+const items = [];
+for (const m of mappings) {
+  if (m.gatewayFileId) continue; // already synced
+  const bot = await storage.getChatbot(m.botId);
+  if (!bot?.useGateway || !bot.gatewayAssistantId || !src.content) continue;
+  items.push({
+    sourceId: `${m.botId}:${contentSourceId}`,
+    assistantId: bot.gatewayAssistantId,
+    filename: `${src.contentType}-${src.name.replace(/[^a-zA-Z0-9]/g, '-').toLowerCase()}.txt`,
+    content: Buffer.from(src.content, 'utf-8'),
+  });
+}
+```
+
+**All unsynced** — full backfill across all gateway bots (use carefully at scale — scope it to off-hours):
+```ts
+// Query all chatbot_content_sources WHERE gateway_file_id IS NULL
+// joined with chatbots WHERE use_gateway = true AND gateway_assistant_id IS NOT NULL
+// joined with content_sources WHERE processing_status = 'processed' AND content IS NOT NULL
+```
+
+### Running the backfill
+
+Use an in-memory state object matching the migration panel pattern — start/stop/status endpoints that your admin UI can drive:
+
+```ts
+let backfillState = { status: 'idle', total: 0, uploaded: 0, failed: 0, stopped: false, stopRequested: false };
+
+// POST /api/admin/gateway/backfill/start
+app.post('/api/admin/gateway/backfill/start', requireAdmin, async (req, res) => {
+  if (!gatewayClient) return res.status(503).json({ ok: false, error: 'Gateway not configured' });
+  if (backfillState.status === 'running') return res.json({ ok: false, message: 'Backfill already running' });
+
+  // Build items array using whichever targeting query fits — bot ID, content source ID, or all unsynced
+  const items = await buildBackfillItems(req.body); // your targeting logic
+  if (items.length === 0) return res.json({ ok: true, message: 'Nothing to backfill', total: 0 });
+
+  backfillState = { status: 'running', total: items.length, uploaded: 0, failed: 0, stopped: false, stopRequested: false };
+  res.json({ ok: true, message: 'Backfill started', total: items.length });
+
+  setImmediate(async () => {
+    const summary = await gatewayClient!.backfillFiles(items, {
+      batchSize: 5,
+      delayMs: 500,
+      stopSignal: () => backfillState.stopRequested,
+      onProgress: async (completed, total, result) => {
+        if (result.status === 'uploaded') {
+          const [botId, contentSourceId] = result.sourceId.split(':').map(Number);
+          await storage.updateContentSourceMapping(botId, contentSourceId, { gatewayFileId: result.fileId! });
+          backfillState.uploaded++;
+        } else {
+          backfillState.failed++;
+          console.error('[backfill] failed:', result.sourceId, result.error);
+        }
+      },
+    });
+    backfillState.status = summary.stopped ? 'stopped' : 'complete';
+    backfillState.stopped = summary.stopped;
+  });
+});
+
+// POST /api/admin/gateway/backfill/stop
+app.post('/api/admin/gateway/backfill/stop', requireAdmin, (req, res) => {
+  backfillState.stopRequested = true;
+  res.json({ ok: true, message: 'Stop requested — will halt after current batch' });
+});
+
+// GET /api/admin/gateway/backfill/status
+app.get('/api/admin/gateway/backfill/status', requireAdmin, (req, res) => {
+  res.json({
+    status: backfillState.status,
+    total: backfillState.total,
+    uploaded: backfillState.uploaded,
+    failed: backfillState.failed,
+    remaining: backfillState.total - backfillState.uploaded - backfillState.failed,
+    stopped: backfillState.stopped,
+  });
+});
+```
+
+> **Important:** Update `gateway_file_id` per item inside `onProgress`, not in bulk after completion. If the backfill is stopped or crashes mid-run, already-uploaded files retain their `gatewayFileId` and will be skipped on the next run.
+
+> **Scale guidance:** For apps with hundreds of bots and thousands of content sources (e.g. WC B2B), always use targeted scope (by bot or by content source) rather than the full unsynced query. Run during off-hours. Use the stop control freely — the backfill is resumable and idempotent.
+
+**Verify:** run a targeted backfill for one bot. Confirm `gateway_file_id` is populated for its mappings. Ask the bot a question from one of its sources — it should answer correctly without needing a new message to trigger the first-time sync.
+
+---
+
 ## Step 11 — Full cutover & cleanup
 
 Once all bots are individually verified on the gateway:
@@ -539,6 +692,9 @@ The package requires `@types/node` as a dev dependency and must be built before 
 - [ ] Content source attach uploads file to MS and stores `gateway_file_id`
 - [ ] Content source detach deletes file from MS
 - [ ] Content source delete cascade-deletes from MS for all mapped bots
+- [ ] Processing-completion hook wired (Step 10b) — covers re-scrapes and late attaches
+- [ ] Backfill endpoints added (Step 10c) — start/stop/status in admin UI
+- [ ] Existing content source mappings backfilled for all gateway bots
 - [ ] Content knowledge verified end-to-end (bot answers from attached source)
 - [ ] All bots on gateway path
 - [ ] Legacy dependency removed

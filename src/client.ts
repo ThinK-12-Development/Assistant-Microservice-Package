@@ -22,6 +22,10 @@ import type {
   MigrateAssistantResult,
   UploadFileOptions,
   UploadFileResult,
+  BackfillFileItem,
+  BackfillFileResult,
+  BackfillOptions,
+  BackfillSummary,
 } from './types.js';
 
 export class GatewayClient {
@@ -280,6 +284,85 @@ export class GatewayClient {
 
   async deleteFile(assistantId: string, fileId: string): Promise<void> {
     await this.request<void>('DELETE', `/api/v1/assistants/${assistantId}/files/${fileId}`);
+  }
+
+  /**
+   * Upload a targeted set of content source mappings to the MS in controlled batches.
+   *
+   * Your app is responsible for querying which items need backfill (e.g. WHERE gateway_file_id IS NULL,
+   * filtered by bot, by content source, or by processing status). This method handles the upload
+   * mechanics, batching, rate limiting, progress callbacks, and stop/resume.
+   *
+   * Update `gateway_file_id` in your DB inside `onProgress` per item — not in bulk after completion —
+   * so progress is preserved if the backfill is stopped or crashes mid-run.
+   *
+   * @example
+   * ```ts
+   * const items = unmigrated.map(m => ({
+   *   sourceId: `${m.botId}:${m.contentSourceId}`,
+   *   assistantId: m.gatewayAssistantId,
+   *   filename: `${m.contentType}-${m.name}.txt`,
+   *   content: Buffer.from(m.content, 'utf-8'),
+   * }));
+   *
+   * const summary = await client.backfillFiles(items, {
+   *   batchSize: 5,
+   *   delayMs: 500,
+   *   stopSignal: () => stopRequested,
+   *   onProgress: async (completed, total, result) => {
+   *     if (result.status === 'uploaded') {
+   *       const [botId, contentSourceId] = result.sourceId.split(':').map(Number);
+   *       await storage.updateContentSourceMapping(botId, contentSourceId, { gatewayFileId: result.fileId! });
+   *     }
+   *     console.log(`[backfill] ${completed}/${total} — ${result.status}`);
+   *   },
+   * });
+   * ```
+   */
+  async backfillFiles(items: BackfillFileItem[], options: BackfillOptions = {}): Promise<BackfillSummary> {
+    const { batchSize = 5, delayMs = 500, onProgress, stopSignal } = options;
+    const results: BackfillFileResult[] = [];
+    let uploaded = 0;
+    let failed = 0;
+    let stopped = false;
+
+    for (let i = 0; i < items.length; i += batchSize) {
+      if (stopSignal?.()) {
+        stopped = true;
+        break;
+      }
+
+      const batch = items.slice(i, i + batchSize);
+
+      for (const item of batch) {
+        let result: BackfillFileResult;
+        try {
+          const file = await this.uploadFile(item.assistantId, {
+            filename: item.filename,
+            content: item.content,
+            mimeType: item.mimeType,
+          });
+          result = { sourceId: item.sourceId, fileId: file.fileId, status: 'uploaded' };
+          uploaded++;
+        } catch (err) {
+          result = {
+            sourceId: item.sourceId,
+            fileId: null,
+            status: 'failed',
+            error: err instanceof Error ? err.message : String(err),
+          };
+          failed++;
+        }
+        results.push(result);
+        if (onProgress) await onProgress(results.length, items.length, result);
+      }
+
+      if (i + batchSize < items.length && !stopSignal?.()) {
+        await new Promise(resolve => setTimeout(resolve, delayMs));
+      }
+    }
+
+    return { total: items.length, uploaded, failed, stopped, results };
   }
 
   // ---------------------------------------------------------------------------

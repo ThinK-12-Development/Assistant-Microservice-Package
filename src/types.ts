@@ -236,6 +236,55 @@ export interface GatewayModel {
 // Files
 // ---------------------------------------------------------------------------
 
+export interface BackfillFileItem {
+  /** Your local composite key (e.g. `"${botId}:${contentSourceId}"`) — echoed back in results so you know which DB row to update. */
+  sourceId: string;
+  /** MS assistant ID to upload the file to. */
+  assistantId: string;
+  /** Filename including extension — determines how the MS processes the content. */
+  filename: string;
+  /** File content as a Buffer or Blob. */
+  content: Buffer | Blob;
+  /** MIME type. Defaults to 'text/plain'. */
+  mimeType?: string;
+}
+
+export interface BackfillFileResult {
+  sourceId: string;
+  /** MS file ID — store this as `gateway_file_id` in your DB. Null on failure. */
+  fileId: string | null;
+  status: 'uploaded' | 'failed';
+  error?: string;
+}
+
+export interface BackfillOptions {
+  /** Files to process per batch. Default: 5. Keep low to avoid overwhelming the MS. */
+  batchSize?: number;
+  /** Milliseconds to wait between batches. Default: 500. */
+  delayMs?: number;
+  /**
+   * Called after each individual file is processed (success or failure).
+   * Update `gateway_file_id` in your DB here — update per item, not in bulk,
+   * so a stop or crash doesn't lose progress already made.
+   * May be async — awaited before the next item starts.
+   */
+  onProgress?: (completed: number, total: number, result: BackfillFileResult) => void | Promise<void>;
+  /**
+   * Return true to stop processing after the current batch completes.
+   * Wire this to your admin stop control so large backfills can be safely halted.
+   */
+  stopSignal?: () => boolean;
+}
+
+export interface BackfillSummary {
+  total: number;
+  uploaded: number;
+  failed: number;
+  /** True if stopSignal() returned true before all items were processed. */
+  stopped: boolean;
+  results: BackfillFileResult[];
+}
+
 export interface UploadFileResult {
   fileId: string;
   filename: string;
