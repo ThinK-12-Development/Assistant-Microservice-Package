@@ -41,4 +41,6 @@ export type {
   BackfillFileResult,
   BackfillOptions,
   BackfillSummary,
+  MessageImageRef,
+  UploadThreadImageOptions,
 } from './types.js';

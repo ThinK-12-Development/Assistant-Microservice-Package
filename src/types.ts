@@ -109,10 +109,40 @@ export interface CircuitSettings {
   [key: string]: unknown;
 }
 
+// ---------------------------------------------------------------------------
+// Images — chat message attachments
+// ---------------------------------------------------------------------------
+
+/**
+ * A reference to an image that has been uploaded to the gateway via `uploadThreadImage()`.
+ * Pass one or more of these in `SendMessageOptions.images` to attach them to a message.
+ */
+export interface MessageImageRef {
+  id: string;
+  s3Key: string;
+  mimeType: string;
+  filename?: string;
+}
+
+export interface UploadThreadImageOptions {
+  /** Image file content as a Buffer or Blob. */
+  content: Buffer | Blob;
+  /** Filename including extension (e.g. "photo.jpg"). */
+  filename: string;
+  /** MIME type of the image (e.g. "image/jpeg"). */
+  mimeType: string;
+}
+
 export interface SendMessageOptions {
   content: string;
   settings?: CircuitSettings;
   maxTokens?: number;
+  /**
+   * Images to attach to this message. Upload each image first with `uploadThreadImage()`
+   * and pass the returned `MessageImageRef` objects here.
+   * Only supported on models where `supportsImages: true`.
+   */
+  images?: MessageImageRef[];
 }
 
 // ---------------------------------------------------------------------------

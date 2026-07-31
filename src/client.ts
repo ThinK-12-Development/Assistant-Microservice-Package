@@ -26,6 +26,8 @@ import type {
   BackfillFileResult,
   BackfillOptions,
   BackfillSummary,
+  MessageImageRef,
+  UploadThreadImageOptions,
 } from './types.js';
 
 export class GatewayClient {
@@ -284,6 +286,44 @@ export class GatewayClient {
 
   async deleteFile(assistantId: string, fileId: string): Promise<void> {
     await this.request<void>('DELETE', `/api/v1/assistants/${assistantId}/files/${fileId}`);
+  }
+
+  /**
+   * Upload one or more images to a thread before sending a message.
+   * Returns `MessageImageRef` objects — pass them in `SendMessageOptions.images`.
+   *
+   * Requires `files:write` scope on the API key.
+   * Maximum 10 images per call; 20 MB per image.
+   *
+   * @example
+   * ```ts
+   * const refs = await client.uploadThreadImages(threadId, [
+   *   { content: imageBuffer, filename: 'screenshot.png', mimeType: 'image/png' },
+   * ]);
+   * for await (const chunk of client.streamMessage(assistantId, threadId, {
+   *   content: 'What do you see in this image?',
+   *   images: refs,
+   * })) { ... }
+   * ```
+   */
+  async uploadThreadImages(threadId: string, images: UploadThreadImageOptions[]): Promise<MessageImageRef[]> {
+    const form = new FormData();
+    for (const img of images) {
+      const blob = img.content instanceof Blob
+        ? img.content
+        : new Blob([new Uint8Array(img.content as Buffer)], { type: img.mimeType });
+      form.append('images', blob, img.filename);
+    }
+
+    const res = await fetch(this.url(`/api/v1/threads/${threadId}/images`), {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${this.apiKey}` },
+      body: form,
+    });
+
+    const json = await res.json().catch(() => ({}));
+    if (!res.ok) throw parseGatewayError(res.status, json);
+    return (json as { data: { images: MessageImageRef[] } }).data.images;
   }
 
   /**
