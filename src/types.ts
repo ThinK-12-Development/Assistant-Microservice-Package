@@ -36,6 +36,7 @@ export interface CreateAssistantInput {
   description?: string;
   instructions: string;
   modelId: string;
+  providerMode?: string;
   productId?: string;
   productName?: string;
   temperature?: number;
@@ -135,6 +136,13 @@ export interface UploadThreadImageOptions {
 
 export interface SendMessageOptions {
   content: string;
+  /**
+   * Per-message instruction override injected on top of the assistant's base instructions.
+   * Use this to pass personalized context (e.g. Pinecone RAG results, user-specific rules)
+   * that should vary per message rather than being baked into the assistant's system prompt.
+   * Equivalent to `additional_instructions` on an OpenAI Assistants API run.
+   */
+  additionalInstructions?: string;
   settings?: CircuitSettings;
   maxTokens?: number;
   /**
@@ -234,6 +242,7 @@ export interface MigrateAssistantInput {
   name: string;
   instructions: string;
   modelId: string;
+  providerMode?: string;
   description?: string;
   temperature?: number;
   maxTokens?: number;
