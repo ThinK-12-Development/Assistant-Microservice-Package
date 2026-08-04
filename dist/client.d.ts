@@ -16,7 +16,7 @@ export declare class GatewayClient {
     createThread(assistantId: string, options?: CreateThreadOptions): Promise<Thread>;
     getThread(assistantId: string, threadId: string): Promise<Thread>;
     deleteThread(assistantId: string, threadId: string): Promise<void>;
-    sendMessage(assistantId: string, threadId: string, options: SendMessageOptions): Promise<SendMessageResult>;
+    sendMessage(_assistantId: string, threadId: string, options: SendMessageOptions): Promise<SendMessageResult>;
     /**
      * Stream a message response as an async iterator of text chunks.
      * Each yielded object has `{ type: 'text', text: string }`.

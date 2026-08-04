@@ -121,13 +121,16 @@ export class GatewayClient {
   // ---------------------------------------------------------------------------
 
   async sendMessage(
-    assistantId: string,
+    _assistantId: string,
     threadId: string,
     options: SendMessageOptions,
   ): Promise<SendMessageResult> {
+    // NOTE: the MS resolves the assistant from the thread itself — the route is
+    // /threads/:threadId/messages, not nested under /assistants/:assistantId/.
+    // assistantId is kept as a parameter for API-shape symmetry with sendMessage's siblings.
     return this.request<SendMessageResult>(
       'POST',
-      `/api/v1/assistants/${assistantId}/threads/${threadId}/messages`,
+      `/api/v1/threads/${threadId}/messages`,
       options,
     );
   }

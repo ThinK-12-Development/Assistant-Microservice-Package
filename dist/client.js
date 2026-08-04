@@ -73,8 +73,11 @@ class GatewayClient {
     // ---------------------------------------------------------------------------
     // Messages (non-streaming)
     // ---------------------------------------------------------------------------
-    async sendMessage(assistantId, threadId, options) {
-        return this.request('POST', `/api/v1/assistants/${assistantId}/threads/${threadId}/messages`, options);
+    async sendMessage(_assistantId, threadId, options) {
+        // NOTE: the MS resolves the assistant from the thread itself — the route is
+        // /threads/:threadId/messages, not nested under /assistants/:assistantId/.
+        // assistantId is kept as a parameter for API-shape symmetry with sendMessage's siblings.
+        return this.request('POST', `/api/v1/threads/${threadId}/messages`, options);
     }
     // ---------------------------------------------------------------------------
     // Messages (streaming)

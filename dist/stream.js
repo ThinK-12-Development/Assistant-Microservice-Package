@@ -5,23 +5,32 @@ exports.collectStream = collectStream;
 const errors_js_1 = require("./errors.js");
 // Vercel AI SDK Data Stream Protocol: text chunks arrive as lines prefixed `0:"..."`
 const TEXT_CHUNK_RE = /^0:"((?:[^"\\]|\\.)*)"/;
-function parseLine(trimmed) {
-    // Bridge SSE format: data: {"type":"chunk","content":"..."}
+function parseEvent(trimmed) {
+    // Bridge SSE format: data: {"type":"...","...":...}
     if (trimmed.startsWith('data: ')) {
         const payload = trimmed.slice(6);
+        let parsed;
         try {
-            const parsed = JSON.parse(payload);
-            if (parsed.type === 'chunk' && typeof parsed.content === 'string') {
-                return parsed.content;
-            }
+            parsed = JSON.parse(payload);
         }
-        catch { }
-        return null;
+        catch {
+            return null;
+        }
+        switch (parsed.type) {
+            case 'chunk':
+                return typeof parsed.content === 'string' ? { type: 'text', text: parsed.content } : null;
+            case 'image_generated':
+                return parsed.image ? { type: 'image_generated', image: parsed.image } : null;
+            case 'done':
+                return parsed.message ? { type: 'message', message: parsed.message } : null;
+            default:
+                return null;
+        }
     }
     // Vercel AI SDK format: 0:"..."
     const match = TEXT_CHUNK_RE.exec(trimmed);
     if (match) {
-        return JSON.parse(`"${match[1]}"`);
+        return { type: 'text', text: JSON.parse(`"${match[1]}"`) };
     }
     return null;
 }
@@ -58,16 +67,16 @@ async function* parseDataStream(response) {
                 const trimmed = line.trim();
                 if (!trimmed)
                     continue;
-                const text = parseLine(trimmed);
-                if (text !== null)
-                    yield { type: 'text', text };
+                const chunk = parseEvent(trimmed);
+                if (chunk !== null)
+                    yield chunk;
             }
         }
         // Flush remaining buffer
         if (buffer.trim()) {
-            const text = parseLine(buffer.trim());
-            if (text !== null)
-                yield { type: 'text', text };
+            const chunk = parseEvent(buffer.trim());
+            if (chunk !== null)
+                yield chunk;
         }
     }
     finally {

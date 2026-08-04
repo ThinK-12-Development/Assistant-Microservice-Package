@@ -1,30 +1,45 @@
 import { RateLimitError, parseGatewayError } from './errors.js';
+import type { Message, MessageImageRef } from './types.js';
 
 // Vercel AI SDK Data Stream Protocol: text chunks arrive as lines prefixed `0:"..."`
 const TEXT_CHUNK_RE = /^0:"((?:[^"\\]|\\.)*)"/;
 
 export interface StreamChunk {
-  type: 'text' | 'done';
+  type: 'text' | 'image_generated' | 'message' | 'done';
   text?: string;
+  /** Present when type === 'image_generated'. Emitted as soon as the MS finishes generating an image, before the text response completes. */
+  image?: MessageImageRef;
+  /** Present when type === 'message'. The persisted assistant message, including `images` if the MS generated one for this turn. Yielded just before the final `done` chunk. */
+  message?: Message;
 }
 
-function parseLine(trimmed: string): string | null {
-  // Bridge SSE format: data: {"type":"chunk","content":"..."}
+function parseEvent(trimmed: string): StreamChunk | null {
+  // Bridge SSE format: data: {"type":"...","...":...}
   if (trimmed.startsWith('data: ')) {
     const payload = trimmed.slice(6);
+    let parsed: Record<string, unknown>;
     try {
-      const parsed = JSON.parse(payload) as Record<string, unknown>;
-      if (parsed.type === 'chunk' && typeof parsed.content === 'string') {
-        return parsed.content;
-      }
-    } catch {}
-    return null;
+      parsed = JSON.parse(payload) as Record<string, unknown>;
+    } catch {
+      return null;
+    }
+
+    switch (parsed.type) {
+      case 'chunk':
+        return typeof parsed.content === 'string' ? { type: 'text', text: parsed.content } : null;
+      case 'image_generated':
+        return parsed.image ? { type: 'image_generated', image: parsed.image as MessageImageRef } : null;
+      case 'done':
+        return parsed.message ? { type: 'message', message: parsed.message as Message } : null;
+      default:
+        return null;
+    }
   }
 
   // Vercel AI SDK format: 0:"..."
   const match = TEXT_CHUNK_RE.exec(trimmed);
   if (match) {
-    return JSON.parse(`"${match[1]}"`);
+    return { type: 'text', text: JSON.parse(`"${match[1]}"`) };
   }
 
   return null;
@@ -69,15 +84,15 @@ export async function* parseDataStream(response: Response): AsyncIterable<Stream
       for (const line of lines) {
         const trimmed = line.trim();
         if (!trimmed) continue;
-        const text = parseLine(trimmed);
-        if (text !== null) yield { type: 'text', text };
+        const chunk = parseEvent(trimmed);
+        if (chunk !== null) yield chunk;
       }
     }
 
     // Flush remaining buffer
     if (buffer.trim()) {
-      const text = parseLine(buffer.trim());
-      if (text !== null) yield { type: 'text', text };
+      const chunk = parseEvent(buffer.trim());
+      if (chunk !== null) yield chunk;
     }
   } finally {
     reader.releaseLock();

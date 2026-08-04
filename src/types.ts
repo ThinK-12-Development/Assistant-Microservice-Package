@@ -76,6 +76,7 @@ export interface Message {
   threadId: string;
   role: 'user' | 'assistant';
   content: string;
+  images?: MessageImageRef[];
   createdAt: string;
 }
 
