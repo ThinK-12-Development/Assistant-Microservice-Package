@@ -8,6 +8,13 @@ export interface StreamChunk {
     message?: Message;
 }
 /**
+ * The MS stores `messages.images` as a JSON-serialized TEXT column and returns it
+ * as-is (a raw string, not an array) on every endpoint — REST and streaming alike.
+ * Normalize it here so `Message.images` actually matches its declared type instead
+ * of leaking the raw storage encoding to callers.
+ */
+export declare function normalizeMessageImages(raw: unknown): MessageImageRef[] | undefined;
+/**
  * Parse an SSE stream response into an async iterator of text chunks.
  * Handles both the MS bridge format (data: {"type":"chunk","content":"..."})
  * and the Vercel AI SDK format (0:"...").

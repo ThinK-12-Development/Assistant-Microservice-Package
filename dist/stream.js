@@ -1,10 +1,33 @@
 "use strict";
 Object.defineProperty(exports, "__esModule", { value: true });
+exports.normalizeMessageImages = normalizeMessageImages;
 exports.parseDataStream = parseDataStream;
 exports.collectStream = collectStream;
 const errors_js_1 = require("./errors.js");
 // Vercel AI SDK Data Stream Protocol: text chunks arrive as lines prefixed `0:"..."`
 const TEXT_CHUNK_RE = /^0:"((?:[^"\\]|\\.)*)"/;
+/**
+ * The MS stores `messages.images` as a JSON-serialized TEXT column and returns it
+ * as-is (a raw string, not an array) on every endpoint — REST and streaming alike.
+ * Normalize it here so `Message.images` actually matches its declared type instead
+ * of leaking the raw storage encoding to callers.
+ */
+function normalizeMessageImages(raw) {
+    if (Array.isArray(raw))
+        return raw;
+    if (typeof raw !== 'string' || raw.length === 0)
+        return undefined;
+    try {
+        const parsed = JSON.parse(raw);
+        return Array.isArray(parsed) ? parsed : undefined;
+    }
+    catch {
+        return undefined;
+    }
+}
+function normalizeMessage(raw) {
+    return { ...raw, images: normalizeMessageImages(raw.images) };
+}
 function parseEvent(trimmed) {
     // Bridge SSE format: data: {"type":"...","...":...}
     if (trimmed.startsWith('data: ')) {
@@ -22,7 +45,9 @@ function parseEvent(trimmed) {
             case 'image_generated':
                 return parsed.image ? { type: 'image_generated', image: parsed.image } : null;
             case 'done':
-                return parsed.message ? { type: 'message', message: parsed.message } : null;
+                return parsed.message
+                    ? { type: 'message', message: normalizeMessage(parsed.message) }
+                    : null;
             default:
                 return null;
         }

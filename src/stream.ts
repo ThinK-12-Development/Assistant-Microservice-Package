@@ -13,6 +13,27 @@ export interface StreamChunk {
   message?: Message;
 }
 
+/**
+ * The MS stores `messages.images` as a JSON-serialized TEXT column and returns it
+ * as-is (a raw string, not an array) on every endpoint — REST and streaming alike.
+ * Normalize it here so `Message.images` actually matches its declared type instead
+ * of leaking the raw storage encoding to callers.
+ */
+export function normalizeMessageImages(raw: unknown): MessageImageRef[] | undefined {
+  if (Array.isArray(raw)) return raw as MessageImageRef[];
+  if (typeof raw !== 'string' || raw.length === 0) return undefined;
+  try {
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed) ? (parsed as MessageImageRef[]) : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function normalizeMessage(raw: Record<string, unknown>): Message {
+  return { ...raw, images: normalizeMessageImages(raw.images) } as Message;
+}
+
 function parseEvent(trimmed: string): StreamChunk | null {
   // Bridge SSE format: data: {"type":"...","...":...}
   if (trimmed.startsWith('data: ')) {
@@ -30,7 +51,9 @@ function parseEvent(trimmed: string): StreamChunk | null {
       case 'image_generated':
         return parsed.image ? { type: 'image_generated', image: parsed.image as MessageImageRef } : null;
       case 'done':
-        return parsed.message ? { type: 'message', message: parsed.message as Message } : null;
+        return parsed.message
+          ? { type: 'message', message: normalizeMessage(parsed.message as Record<string, unknown>) }
+          : null;
       default:
         return null;
     }

@@ -77,7 +77,13 @@ class GatewayClient {
         // NOTE: the MS resolves the assistant from the thread itself — the route is
         // /threads/:threadId/messages, not nested under /assistants/:assistantId/.
         // assistantId is kept as a parameter for API-shape symmetry with sendMessage's siblings.
-        return this.request('POST', `/api/v1/threads/${threadId}/messages`, options);
+        const result = await this.request('POST', `/api/v1/threads/${threadId}/messages`, options);
+        // The MS returns message.images as a raw JSON string (its storage encoding) —
+        // normalize it to match the declared Message.images type before handing it back.
+        return {
+            ...result,
+            message: { ...result.message, images: (0, stream_js_1.normalizeMessageImages)(result.message.images) },
+        };
     }
     // ---------------------------------------------------------------------------
     // Messages (streaming)
