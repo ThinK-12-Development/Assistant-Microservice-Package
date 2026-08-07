@@ -134,7 +134,7 @@ class GatewayClient {
     // Completions (one-shot, no thread)
     // ---------------------------------------------------------------------------
     async complete(options) {
-        return this.request('POST', '/api/v1/complete', options);
+        return this.request('POST', '/api/v1/completions', options);
     }
     // ---------------------------------------------------------------------------
     // Embeddings

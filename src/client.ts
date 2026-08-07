@@ -208,7 +208,7 @@ export class GatewayClient {
   // ---------------------------------------------------------------------------
 
   async complete(options: CompleteOptions): Promise<CompleteResult> {
-    return this.request<CompleteResult>('POST', '/api/v1/complete', options);
+    return this.request<CompleteResult>('POST', '/api/v1/completions', options);
   }
 
   // ---------------------------------------------------------------------------
