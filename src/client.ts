@@ -3,6 +3,9 @@ import { parseDataStream, collectStream, normalizeMessageImages, StreamChunk } f
 import type {
   GatewayClientOptions,
   Assistant,
+  Message,
+  Usage,
+  Retrieval,
   CreateAssistantInput,
   UpdateAssistantInput,
   Thread,
@@ -125,19 +128,25 @@ export class GatewayClient {
     threadId: string,
     options: SendMessageOptions,
   ): Promise<SendMessageResult> {
+    const start = Date.now();
     // NOTE: the MS resolves the assistant from the thread itself — the route is
     // /threads/:threadId/messages, not nested under /assistants/:assistantId/.
     // assistantId is kept as a parameter for API-shape symmetry with sendMessage's siblings.
-    const result = await this.request<SendMessageResult>(
+    const result = await this.request<{ userMessage: Message; assistantMessage: Message; usage: Usage; retrieval: Retrieval }>(
       'POST',
       `/api/v1/threads/${threadId}/messages`,
       options,
     );
-    // The MS returns message.images as a raw JSON string (its storage encoding) —
-    // normalize it to match the declared Message.images type before handing it back.
+    // MS's actual response has separate userMessage/assistantMessage records, not a
+    // single `message` field -- SendMessageResult.message is populated from
+    // assistantMessage (the turn the caller actually wants). The MS also returns
+    // message.images as a raw JSON string (its storage encoding) -- normalize it to
+    // match the declared Message.images type before handing it back.
     return {
-      ...result,
-      message: { ...result.message, images: normalizeMessageImages((result.message as any).images) },
+      usage: result.usage,
+      retrieval: result.retrieval,
+      latencyMs: Date.now() - start,
+      message: { ...result.assistantMessage, images: normalizeMessageImages((result.assistantMessage as any)?.images) },
     };
   }
 

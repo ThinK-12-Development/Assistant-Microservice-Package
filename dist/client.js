@@ -74,15 +74,21 @@ class GatewayClient {
     // Messages (non-streaming)
     // ---------------------------------------------------------------------------
     async sendMessage(_assistantId, threadId, options) {
+        const start = Date.now();
         // NOTE: the MS resolves the assistant from the thread itself — the route is
         // /threads/:threadId/messages, not nested under /assistants/:assistantId/.
         // assistantId is kept as a parameter for API-shape symmetry with sendMessage's siblings.
         const result = await this.request('POST', `/api/v1/threads/${threadId}/messages`, options);
-        // The MS returns message.images as a raw JSON string (its storage encoding) —
-        // normalize it to match the declared Message.images type before handing it back.
+        // MS's actual response has separate userMessage/assistantMessage records, not a
+        // single `message` field -- SendMessageResult.message is populated from
+        // assistantMessage (the turn the caller actually wants). The MS also returns
+        // message.images as a raw JSON string (its storage encoding) -- normalize it to
+        // match the declared Message.images type before handing it back.
         return {
-            ...result,
-            message: { ...result.message, images: (0, stream_js_1.normalizeMessageImages)(result.message.images) },
+            usage: result.usage,
+            retrieval: result.retrieval,
+            latencyMs: Date.now() - start,
+            message: { ...result.assistantMessage, images: (0, stream_js_1.normalizeMessageImages)(result.assistantMessage?.images) },
         };
     }
     // ---------------------------------------------------------------------------
