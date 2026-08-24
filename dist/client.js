@@ -64,11 +64,19 @@ class GatewayClient {
     async createThread(assistantId, options) {
         return this.request('POST', `/api/v1/assistants/${assistantId}/threads`, options ?? {});
     }
-    async getThread(assistantId, threadId) {
-        return this.request('GET', `/api/v1/assistants/${assistantId}/threads/${threadId}`);
+    async getThread(_assistantId, threadId) {
+        // Same URL fix as deleteThread -- MS's route is the un-nested GET /api/v1/threads/:threadId.
+        return this.request('GET', `/api/v1/threads/${threadId}`);
     }
-    async deleteThread(assistantId, threadId) {
-        await this.request('DELETE', `/api/v1/assistants/${assistantId}/threads/${threadId}`);
+    async deleteThread(_assistantId, threadId) {
+        // MS never registered a route nested under /assistants/:assistantId for this --
+        // its only delete-thread route is DELETE /api/v1/threads/:threadId, which looks
+        // up and authorizes the thread purely by threadId (see canAccessAssistant check
+        // in the route itself). The old URL 404d unconditionally on every call, silently
+        // (callers wrap this in .catch), so no thread was ever actually being deleted.
+        // assistantId is kept as a parameter for API-shape symmetry with this method's
+        // siblings -- same convention as sendMessage's _assistantId.
+        await this.request('DELETE', `/api/v1/threads/${threadId}`);
     }
     // ---------------------------------------------------------------------------
     // Messages (non-streaming)
