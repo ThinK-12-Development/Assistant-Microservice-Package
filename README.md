@@ -137,6 +137,19 @@ await client.sendMessage('asst_abc123', thread.threadId, {
 });
 ```
 
+### Scoping file_search to a single file (bridge-mode assistants)
+
+By default, file_search on a bridge-mode assistant searches every file in its knowledge base. Pass `fileId` (the id returned from `uploadFile()`) to scope a single message's search to one specific file:
+
+```ts
+await client.sendMessage('asst_abc123', thread.threadId, {
+  content: 'Summarize this document.',
+  fileId: 'file_xyz789',
+});
+```
+
+Only files uploaded after this option was added carry the metadata needed to be filtered this way — files uploaded before then need to be re-uploaded to become filterable. Has no effect on non-bridge (internal/Pinecone) assistants.
+
 ### One-shot completion (no thread)
 
 For prompts that don't need conversation history:

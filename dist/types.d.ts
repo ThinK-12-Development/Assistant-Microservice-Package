@@ -115,6 +115,14 @@ export interface SendMessageOptions {
      * Only supported on models where `supportsImages: true`.
      */
     images?: MessageImageRef[];
+    /**
+     * Scope file_search (bridge-mode assistants only) to a single previously
+     * uploaded file, by the fileId returned from `uploadFile()`. Omit to
+     * search the assistant's whole knowledge base as usual. Files uploaded
+     * before this option existed are not taggable/filterable until re-uploaded.
+     * Has no effect on non-bridge (internal/Pinecone) assistants.
+     */
+    fileId?: string;
 }
 export interface CompleteOptions {
     prompt: string;
