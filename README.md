@@ -150,6 +150,21 @@ await client.sendMessage('asst_abc123', thread.threadId, {
 
 Only files uploaded after this option was added carry the metadata needed to be filtered this way — files uploaded before then need to be re-uploaded to become filterable. Has no effect on non-bridge (internal/Pinecone) assistants.
 
+### Replacing instructions for one call (bridge-mode assistants)
+
+`additionalInstructions` and `settings` are always composed **on top of** the assistant's stored instructions. `override.instructions` **replaces** them instead, for that one call only — useful when you need the assistant's grounding/knowledge base but not its persona/behavioral rules, e.g. a non-conversational content-generation call where appending a second instruction on top of the assistant's normal rules ("never give direct answers", for example) would produce two contradicting instructions in the same prompt rather than removing the conflict:
+
+```ts
+await client.sendMessage('asst_abc123', thread.threadId, {
+  content: 'Generate 5 practice questions with answer keys.',
+  override: {
+    instructions: 'You are authoring content for a teacher, not tutoring a student. Return complete, correct answers.',
+  },
+});
+```
+
+Omit `override.instructions` and behavior is unchanged — the assistant's stored instructions apply as usual.
+
 ### One-shot completion (no thread)
 
 For prompts that don't need conversation history:

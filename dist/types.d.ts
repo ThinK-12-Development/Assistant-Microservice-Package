@@ -123,6 +123,23 @@ export interface SendMessageOptions {
      * Has no effect on non-bridge (internal/Pinecone) assistants.
      */
     fileId?: string;
+    /**
+     * Per-message override. Unlike `additionalInstructions`/`settings` (always
+     * composed on top of the assistant's stored instructions), `override.instructions`
+     * — when set — REPLACES them for this one call. Use this when you need the
+     * assistant's grounding/knowledge base but not its persona/behavioral rules
+     * for a non-conversational call (e.g. content generation), where appending a
+     * second instruction on top of an existing one risks producing two
+     * contradicting instructions in the same prompt.
+     *
+     * The gateway's override object also accepts modelId/temperature/maxTokens
+     * (bridge-mode assistants don't currently apply those — see MS routes-v1.ts) —
+     * only instructions is exposed here since that's this field's one job.
+     */
+    override?: {
+        /** Replaces the assistant's stored instructions for this one call. See above. */
+        instructions?: string;
+    };
 }
 export interface CompleteOptions {
     prompt: string;
